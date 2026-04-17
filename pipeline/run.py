@@ -7,7 +7,6 @@ from pathlib import Path
 from pipeline.config import PipelineConfig
 from pipeline.extract_frames import extract_frames
 from pipeline.run_vggt_slam import run_vggt_slam, save_vggt_slam_output
-from pipeline.convert import convert_vggt_to_boxer, save_boxer_input
 from pipeline.run_boxer import run_boxer
 from pipeline.export import export_scene_graph
 
@@ -19,9 +18,8 @@ def run_pipeline(config: PipelineConfig) -> Path:
     Steps:
         1. Extract frames from video (ffmpeg)
         2. Run VGGT-SLAM (submapping + SL(4) optimization + loop closure)
-        3. Convert VGGT-SLAM output to Boxer input format
-        4. Run Boxer inference (2D detection + 3D lifting)
-        5. Export scene graph JSON
+        3. Run Boxer (OWLv2 + BoxerNet) on each VGGT-SLAM keyframe
+        4. Export scene graph JSON
 
     Args:
         config: Pipeline configuration.
@@ -33,14 +31,14 @@ def run_pipeline(config: PipelineConfig) -> Path:
     t0 = time.time()
 
     # Step 1: Extract frames
-    print("\n=== Step 1/5: Extracting frames ===")
-    frame_paths = extract_frames(
+    print("\n=== Step 1/4: Extracting frames ===")
+    extract_frames(
         config.video_path, config.frames_dir,
         fps=config.fps, max_frames=config.max_frames,
     )
 
     # Step 2: VGGT-SLAM inference
-    print("\n=== Step 2/5: Running VGGT-SLAM ===")
+    print("\n=== Step 2/4: Running VGGT-SLAM ===")
     vggt_slam_output = run_vggt_slam(
         frame_dir=config.frames_dir,
         device=config.device,
@@ -52,35 +50,25 @@ def run_pipeline(config: PipelineConfig) -> Path:
     )
     save_vggt_slam_output(vggt_slam_output, config.vggt_slam_output_dir)
 
-    # Step 3: Format conversion
-    print("\n=== Step 3/5: Converting VGGT-SLAM → Boxer format ===")
-    boxer_input = convert_vggt_to_boxer(
-        vggt_slam_output, max_semidense_points=config.max_semidense_points,
-    )
-    save_boxer_input(boxer_input, config.boxer_output_dir)
-
-    # Step 4: Boxer inference
-    # VGGT-SLAM picks keyframes via optical-flow disparity, so the set Boxer
-    # sees is typically a subset of the extracted frames.
-    print("\n=== Step 4/5: Running Boxer ===")
-    boxer_frame_paths = [Path(p) for p in vggt_slam_output.image_names]
+    # Step 3: Boxer inference (OWLv2 + BoxerNet) per keyframe
+    print("\n=== Step 3/4: Running Boxer ===")
+    labels = [s.strip() for s in config.labels.split(",") if s.strip()]
     boxer_output = run_boxer(
-        boxer_frame_paths, boxer_input, config.boxer_output_dir,
-        labels=config.labels,
+        vggt_slam_output_dir=config.vggt_slam_output_dir,
+        output_dir=config.boxer_output_dir,
+        labels=labels,
+        device=config.device,
         thresh_2d=config.thresh_2d,
         thresh_3d=config.thresh_3d,
-        track=config.track,
-        fuse=config.fuse,
-        device=config.device,
     )
 
-    # Step 5: Export
-    print("\n=== Step 5/5: Exporting scene graph ===")
+    # Step 4: Export scene graph
+    print("\n=== Step 4/4: Exporting scene graph ===")
     output_path = config.output_dir / "scene_graph.json"
     export_scene_graph(
         boxer_output, output_path,
         source_video=config.video_path.name,
-        num_frames=len(boxer_frame_paths),
+        num_frames=vggt_slam_output.extrinsic.shape[0],
     )
 
     elapsed = time.time() - t0
@@ -95,11 +83,11 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic: auto-detect device, 12 fps extraction
+  # Basic: auto-detect device, 12 fps extraction, default Boxer labels
   python -m pipeline.run --video test/IMG_6826.MOV --output output/
 
-  # Tune VGGT-SLAM submapping + loop closures
-  python -m pipeline.run --video tour.mov --fps 12 --submap-size 16 --max-loops 1
+  # Custom object labels for OWLv2
+  python -m pipeline.run --video tour.mov --labels "chair,table,monitor,laptop,lamp"
 
   # Force CPU on Mac mini
   python -m pipeline.run --video tour.mov --device cpu
@@ -113,8 +101,13 @@ Examples:
     parser.add_argument("--max-loops", type=int, default=1, help="Max loop closures per submap")
     parser.add_argument("--min-disparity", type=float, default=50.0,
                         help="Keyframe selection optical-flow threshold")
-    parser.add_argument("--labels", type=str, default="lvisplus", help="Object labels / taxonomy")
-    parser.add_argument("--track", action="store_true", help="Enable temporal tracking")
+    parser.add_argument(
+        "--labels", type=str,
+        default="chair,table,sofa,bed,monitor,keyboard,laptop,book,lamp,plant",
+        help="Comma-separated OWLv2 text prompts",
+    )
+    parser.add_argument("--thresh-2d", type=float, default=0.25)
+    parser.add_argument("--thresh-3d", type=float, default=0.5)
     parser.add_argument("--device", type=str, default=None, help="Force device (cuda/mps/cpu)")
     args = parser.parse_args()
 
@@ -127,7 +120,8 @@ Examples:
         max_loops=args.max_loops,
         min_disparity=args.min_disparity,
         labels=args.labels,
-        track=args.track,
+        thresh_2d=args.thresh_2d,
+        thresh_3d=args.thresh_3d,
     )
     if args.device:
         config.device = args.device

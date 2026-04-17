@@ -20,7 +20,7 @@ def export_scene_graph(
         boxer_output: Output from Boxer inference.
         output_path: Path to write the JSON file.
         source_video: Name of the source video file.
-        num_frames: Number of frames processed.
+        num_frames: Number of keyframes processed.
 
     Returns:
         Path to the written JSON file.
@@ -36,7 +36,8 @@ def export_scene_graph(
             "type": "gravity_aligned_metric",
             "up_axis": "Z",
             "units": "meters",
-            "convention": "VGGT OpenCV world frame, gravity = +Y",
+            "convention": "Boxer world frame (Z-down gravity), "
+                          "pre-rotated from VGGT-SLAM Y-down by Rx(-π/2)",
         },
         "objects": [
             {
@@ -47,8 +48,8 @@ def export_scene_graph(
                 "yaw": obj.yaw,
                 "confidence": obj.confidence,
                 "uncertainty": obj.uncertainty,
-                "first_seen_frame": obj.first_seen_frame,
-                "last_seen_frame": obj.last_seen_frame,
+                "frame_idx": obj.frame_idx,
+                "time_ns": obj.time_ns,
             }
             for i, obj in enumerate(boxer_output.objects)
         ],
@@ -66,10 +67,12 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Export scene graph JSON")
-    parser.add_argument("--boxer-output", type=Path, required=True)
+    parser.add_argument("--boxer-output", type=Path, required=True,
+                        help="Boxer output directory (unused; for symmetry only)")
     parser.add_argument("--output", type=Path, default=Path("scene_graph.json"))
     args = parser.parse_args()
 
-    # Load boxer output (placeholder for now)
+    # Standalone export has no BoxerOutput to read — pipeline.run does the
+    # writing end-to-end. Left as a placeholder for future CSV-based exports.
     boxer_output = BoxerOutput(objects=[], raw_boxes_per_frame={})
     export_scene_graph(boxer_output, args.output)

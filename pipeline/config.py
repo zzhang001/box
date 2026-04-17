@@ -36,12 +36,10 @@ class PipelineConfig:
     conf_threshold: float = 25.0
     lc_thres: float = 0.95
 
-    # Boxer settings
-    labels: str = "lvisplus"
+    # Boxer settings — `labels` is a comma-separated list of OWLv2 text prompts.
+    labels: str = "chair,table,sofa,bed,monitor,keyboard,laptop,book,lamp,plant"
     thresh_2d: float = 0.25
     thresh_3d: float = 0.5
-    track: bool = False
-    fuse: bool = True
     max_semidense_points: int = 10000
 
     # Hardware
