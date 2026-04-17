@@ -199,7 +199,8 @@ def _build_datum(
         "T_world_rig0": T_world_rig0.float(),
         "sdp_w": sdp_w,
         "time_ns0": time_ns,
-        "rotated0": torch.tensor(False),
+        # BoxerNet.process_camera asserts rotated0.ndim == 1 (per-batch flag).
+        "rotated0": torch.tensor([False]),
         "bb2d0": torch.zeros(0, 4, dtype=torch.float32),
     }
     return datum, img_bgr
