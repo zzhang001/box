@@ -1,7 +1,13 @@
-"""Convert VGGT outputs to Boxer input format.
+"""Convert VGGT / VGGT-SLAM outputs to Boxer input format.
 
 VGGT uses OpenCV camera convention (x-right, y-down, z-forward).
-Boxer expects gravity-aligned world frame with SE(3) poses.
+VGGT-SLAM preserves that convention per-submap and rectifies submaps to a
+globally consistent SL(4)-aligned world frame after loop closure.
+Boxer expects a world frame with SE(3) poses + a gravity vector.
+
+Both `VGGTOutput` (from `pipeline.run_vggt`) and `VGGTSLAMOutput`
+(from `pipeline.run_vggt_slam`) share the same field names/shapes, so this
+module accepts either without branching on source.
 
 Key conversions:
   - Extrinsic: camera_from_world [3,4] → T_world_camera [4,4] (invert)
@@ -12,11 +18,15 @@ Key conversions:
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Union
 
 import numpy as np
 import torch
 
 from pipeline.run_vggt import VGGTOutput
+from pipeline.run_vggt_slam import VGGTSLAMOutput
+
+FrontEndOutput = Union[VGGTOutput, VGGTSLAMOutput]
 
 
 @dataclass
@@ -102,14 +112,17 @@ def extract_semidense_points(
 
 
 def convert_vggt_to_boxer(
-    vggt_output: VGGTOutput,
+    vggt_output: FrontEndOutput,
     max_semidense_points: int = 10000,
 ) -> BoxerInput:
     """
-    Convert VGGT outputs to Boxer-compatible input format.
+    Convert VGGT / VGGT-SLAM outputs to Boxer-compatible input format.
+
+    Accepts either a `VGGTOutput` or a `VGGTSLAMOutput` — both carry
+    identically-shaped `extrinsic`, `intrinsic`, `world_points`, etc.
 
     Args:
-        vggt_output: Output from VGGT inference.
+        vggt_output: Output from VGGT or VGGT-SLAM inference.
         max_semidense_points: Max semi-dense points for Boxer.
 
     Returns:

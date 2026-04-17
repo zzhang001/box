@@ -4,46 +4,57 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "=== VGGT + Boxer Pipeline Setup ==="
+echo "=== VGGT-SLAM + Boxer Pipeline Setup ==="
 
-# Check Python 3.12
-if ! command -v python3.12 &>/dev/null; then
-    echo "ERROR: Python 3.12 is required. Install via: brew install python@3.12"
+# Python 3.11 matches VGGT-SLAM upstream; 3.12 usually works too.
+PY=""
+for candidate in python3.11 python3.12; do
+    if command -v "$candidate" &>/dev/null; then
+        PY="$candidate"
+        break
+    fi
+done
+if [ -z "$PY" ]; then
+    echo "ERROR: Python 3.11 (preferred) or 3.12 required."
+    echo "  Install via: brew install python@3.11"
     exit 1
 fi
+echo "Using: $PY ($(command -v $PY))"
 
-# Check ffmpeg
 if ! command -v ffmpeg &>/dev/null; then
     echo "WARNING: ffmpeg not found. Install via: brew install ffmpeg"
 fi
 
-# Init submodules
 echo "--- Initializing submodules ---"
 git submodule update --init --recursive
 
-# Create venv
 echo "--- Creating virtual environment ---"
-python3.12 -m venv .venv
+$PY -m venv .venv
+# shellcheck disable=SC1091
 source .venv/bin/activate
 
-# Upgrade pip
 pip install --upgrade pip setuptools wheel
 
-# Install VGGT
-echo "--- Installing VGGT ---"
-pip install -e extern/vggt
+# VGGT-SLAM's setup.sh installs requirements + salad + VGGT_SPARK fork +
+# perception-encoder + sam3 into extern/vggt_slam/third_party. We delegate
+# instead of duplicating: keeps our setup in sync when upstream changes.
+# (Perception-encoder and SAM3 are only used behind --run_os; they install
+# unconditionally. Safe to prune later if disk-constrained.)
+echo "--- Installing VGGT-SLAM deps (salad + VGGT_SPARK + gtsam + SAM3 + PE) ---"
+pushd extern/vggt_slam >/dev/null
+chmod +x setup.sh
+./setup.sh
+popd >/dev/null
 
-# Install Boxer dependencies
 echo "--- Installing Boxer ---"
-cd extern/boxer
+pushd extern/boxer >/dev/null
 if [ -f "pyproject.toml" ]; then
     pip install -e .
 elif [ -f "requirements.txt" ]; then
     pip install -r requirements.txt
 fi
-cd "$SCRIPT_DIR"
+popd >/dev/null
 
-# Install this pipeline
 echo "--- Installing pipeline ---"
 pip install -e .
 
