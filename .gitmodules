@@ -1,6 +1,3 @@
-[submodule "extern/vggt"]
-	path = extern/vggt
-	url = https://github.com/facebookresearch/vggt.git
 [submodule "extern/boxer"]
 	path = extern/boxer
 	url = https://github.com/facebookresearch/boxer.git

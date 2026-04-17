@@ -6,14 +6,15 @@ VGGT-SLAM extends VGGT with:
   - SL(4) pose-graph optimization across submaps
   - Loop closure via DINO/SALAD image retrieval
 
-Output shape matches the plain-VGGT wrapper (VGGTOutput) so downstream `convert.py`
-and `run_boxer.py` don't need to know which front-end produced the data.
+The output object (`VGGTSLAMOutput`) holds per-keyframe extrinsics /
+intrinsics / depth-conf / world points in the SL(4)-rectified global frame,
+ready for `pipeline.convert.convert_vggt_to_boxer`.
 
-Key trade-offs vs. plain VGGT:
-  - (+) Handles arbitrarily long videos (VGGT alone caps at ~32 frames per chunk).
-  - (+) Globally consistent trajectory after loop closure.
-  - (-) Requires the MIT-SPARK VGGT fork (vggt_spark) + salad + gtsam.
-  - (-) World frame is SL(4)-rectified, not strictly metric Euclidean.
+Notes:
+  - Requires the MIT-SPARK VGGT fork (installed by extern/vggt_slam/setup.sh)
+    plus salad, gtsam, perception-encoder, sam3.
+  - World frame is SL(4)-rectified. For strict metric Euclidean results we
+    would need a post-hoc rectification (see Known Limitations in README).
 """
 
 import os
@@ -40,9 +41,6 @@ if str(_VGGT_SLAM_DIR) not in sys.path:
 @dataclass
 class VGGTSLAMOutput:
     """Per-keyframe outputs from VGGT-SLAM after SL(4) optimization.
-
-    Shape/semantics kept compatible with `pipeline.run_vggt.VGGTOutput` so that
-    `pipeline.convert.convert_vggt_to_boxer` can consume either directly.
 
     Frame ordering: one row per keyframe that VGGT-SLAM retained (loop-closure
     auxiliary frames are excluded). `image_names[i]` is the input path for row i.

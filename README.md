@@ -40,7 +40,6 @@ iPhone (no LiDAR needed)       Mac Mini / Apple Silicon / CUDA box
                                 └────────────────────────────────┘
 ```
 
-> **Front-ends.** `--front-end vggt_slam` (default) is the right choice for iPhone clips. `--front-end vggt` runs plain single-chunk VGGT for short (<32-frame) clips — faster install, no gtsam / salad, but no global consistency.
 
 ---
 
@@ -156,17 +155,15 @@ box/
 ├── setup.sh                    # One-command install (chains VGGT-SLAM's setup.sh)
 │
 ├── extern/
-│   ├── vggt/                   # submodule → facebookresearch/vggt (fallback front-end)
-│   ├── vggt_slam/              # submodule → MIT-SPARK/VGGT-SLAM 2.0 (default front-end)
+│   ├── vggt_slam/              # submodule → MIT-SPARK/VGGT-SLAM 2.0
 │   └── boxer/                  # submodule → facebookresearch/boxer
 │
 ├── pipeline/
 │   ├── __init__.py
-│   ├── config.py               # PipelineConfig (front_end selector)
+│   ├── config.py               # PipelineConfig dataclass
 │   ├── extract_frames.py       # ffmpeg: video → frames
-│   ├── run_vggt.py             # Plain VGGT front-end (short clips)
-│   ├── run_vggt_slam.py        # VGGT-SLAM 2.0 front-end (default)
-│   ├── convert.py              # Front-end output → Boxer input format
+│   ├── run_vggt_slam.py        # VGGT-SLAM 2.0 inference wrapper
+│   ├── convert.py              # VGGT-SLAM output → Boxer input format
 │   ├── run_boxer.py            # Boxer inference wrapper
 │   ├── export.py               # 3D boxes → scene_graph.json
 │   └── run.py                  # End-to-end orchestrator
@@ -209,7 +206,7 @@ cd box
 ### Full Pipeline (video → scene graph)
 
 ```bash
-# Default: VGGT-SLAM front-end, 12 fps, auto device
+# Basic: 12 fps extraction, auto device
 python -m pipeline.run --video test/IMG_6826.MOV --output output/
 
 # Tune for a 30-sec / 1000-frame iPhone clip on Mac mini
@@ -222,9 +219,6 @@ python -m pipeline.run \
     --max-loops 1 \                # Max loop closures per submap
     --labels "chair,table,sofa" \  # Custom Boxer labels
     --device cpu                   # Mac mini: no CUDA; CPU bfloat16 works
-
-# Short-clip fast path — plain VGGT (<32 frames), no gtsam/salad dependency
-python -m pipeline.run --video short.mov --output output/ --front-end vggt
 ```
 
 ### Step-by-Step
@@ -233,13 +227,10 @@ python -m pipeline.run --video short.mov --output output/ --front-end vggt
 # 1. Extract frames
 python -m pipeline.extract_frames --video input.mov --output output/frames/ --fps 12
 
-# 2a. Run VGGT-SLAM (default)
+# 2. Run VGGT-SLAM
 python -m pipeline.run_vggt_slam --frames output/frames/ --output output/vggt_slam/
 
-# 2b. …or plain VGGT
-python -m pipeline.run_vggt --frames output/frames/ --output output/vggt/
-
-# 3. Run Boxer (picks up whichever front-end ran)
+# 3. Run Boxer
 python -m pipeline.run_boxer \
     --frames output/frames/ \
     --vggt-output output/vggt_slam/ \
@@ -285,7 +276,7 @@ python -m pipeline.export --boxer-output output/boxer/ --output scene_graph.json
 
 ## Hardware Tested
 
-| Platform | Device | Front-end | Boxer | Notes |
+| Platform | Device | VGGT-SLAM | Boxer | Notes |
 |----------|--------|-----------|-------|-------|
 | macOS 15 | Mac mini (Apple Silicon) | CPU bfloat16 | CPU/MPS | Dev target for iPhone clips; expect ~minutes for a 30-sec clip |
 | macOS 15 | M3 Max 36GB | MPS / CPU | MPS | Headroom for longer footage |
@@ -297,8 +288,7 @@ python -m pipeline.export --boxer-output output/boxer/ --output scene_graph.json
 
 | Approach | LiDAR? | Global Consistency | Platform | Quality |
 |----------|--------|--------------------|----------|---------|
-| **This pipeline (VGGT-SLAM → Boxer)** | No | Yes (SL(4) + loop closure) | Mac/Linux | High; globally consistent |
-| Plain VGGT → Boxer | No | No (single chunk) | Mac/Linux | OK for short clips only |
+| **This pipeline (VGGT-SLAM → Boxer)** | No | Yes (SL(4) + loop closure) | Mac/Linux | High |
 | ROS bag + Cartographer → Boxer | Depends | Yes | Robot rig | Production; needs bags |
 | Boxer3D (iOS app) | Yes | Yes | iPhone Pro only | Highest |
 | COLMAP + Boxer | No | Yes | Mac/Linux | High, but slow SfM |
@@ -307,8 +297,7 @@ python -m pipeline.export --boxer-output output/boxer/ --output scene_graph.json
 
 ## Roadmap
 
-- [x] Pipeline stubs: video → VGGT → Boxer → JSON (plain VGGT front-end)
-- [x] Add VGGT-SLAM 2.0 front-end (SL(4), loop closure)
+- [x] VGGT-SLAM 2.0 wrapper → Boxer-compatible output
 - [ ] End-to-end validation on iPhone test clip (`test/IMG_6826.MOV`)
 - [ ] Gravity estimation from iPhone IMU / floor-plane RANSAC
 - [ ] Post-hoc Euclidean rectification of SL(4)-warped world
@@ -322,7 +311,6 @@ python -m pipeline.export --boxer-output output/boxer/ --output scene_graph.json
 ## License
 
 This pipeline code is MIT licensed. Submodules have their own licenses:
-- **VGGT**: see [extern/vggt/LICENSE](extern/vggt/LICENSE)
 - **VGGT-SLAM**: see [extern/vggt_slam/LICENSE](extern/vggt_slam/LICENSE)
 - **Boxer**: CC-BY-NC (see [extern/boxer/LICENSE](extern/boxer/LICENSE))
 
@@ -330,6 +318,5 @@ This pipeline code is MIT licensed. Submodules have their own licenses:
 
 ## Acknowledgments
 
-- [VGGT](https://github.com/facebookresearch/vggt) — Jianyuan Wang et al., CVPR 2025 Best Paper
-- [VGGT-SLAM](https://github.com/MIT-SPARK/VGGT-SLAM) — Dominic Maggio et al., MIT-SPARK Lab (2.0, 2026)
+- [VGGT-SLAM](https://github.com/MIT-SPARK/VGGT-SLAM) — Dominic Maggio et al., MIT-SPARK Lab (2.0, 2026), built on [VGGT](https://github.com/facebookresearch/vggt) (Jianyuan Wang et al., CVPR 2025 Best Paper)
 - [Boxer](https://github.com/facebookresearch/boxer) — Daniel DeTone et al., Meta Reality Labs

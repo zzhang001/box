@@ -17,14 +17,7 @@ def _detect_device() -> str:
 
 @dataclass
 class PipelineConfig:
-    """Configuration for the full front-end -> Boxer pipeline.
-
-    The `front_end` field selects how camera poses + depth are produced:
-      - "vggt_slam": VGGT-SLAM 2.0 (default). Handles long videos via submapping
-        + loop closure. Requires MIT-SPARK's VGGT fork + salad + gtsam.
-      - "vggt": Plain VGGT single-chunk inference. Fast for short clips (<32
-        frames) but no global consistency.
-    """
+    """Configuration for the VGGT-SLAM → Boxer pipeline."""
 
     # Input
     video_path: Path = Path("input.mov")
@@ -36,14 +29,7 @@ class PipelineConfig:
     fps: float = 12.0
     max_frames: int = 2000
 
-    # Front-end selection
-    front_end: str = "vggt_slam"  # "vggt_slam" | "vggt"
-
-    # VGGT / VGGT-SLAM shared settings
-    vggt_model: str = "facebook/VGGT-1B"
-    vggt_image_size: int = 518
-
-    # VGGT-SLAM specific
+    # VGGT-SLAM hyperparameters
     submap_size: int = 16
     max_loops: int = 1
     min_disparity: float = 50.0
@@ -63,14 +49,12 @@ class PipelineConfig:
 
     # Derived paths (populated after init)
     frames_dir: Path = field(init=False)
-    front_end_output_dir: Path = field(init=False)
+    vggt_slam_output_dir: Path = field(init=False)
     boxer_output_dir: Path = field(init=False)
 
     def __post_init__(self) -> None:
         self.video_path = Path(self.video_path)
         self.output_dir = Path(self.output_dir)
         self.frames_dir = self.output_dir / "frames"
-        # Keep stage outputs under a front-end-specific subdir so switching
-        # front-ends doesn't clobber the previous run.
-        self.front_end_output_dir = self.output_dir / self.front_end
+        self.vggt_slam_output_dir = self.output_dir / "vggt_slam"
         self.boxer_output_dir = self.output_dir / "boxer"
