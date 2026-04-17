@@ -35,25 +35,40 @@ source .venv/bin/activate
 
 pip install --upgrade pip setuptools wheel
 
-# VGGT-SLAM's setup.sh installs requirements + salad + VGGT_SPARK fork +
-# perception-encoder + sam3 into extern/vggt_slam/third_party. We delegate
-# instead of duplicating: keeps our setup in sync when upstream changes.
-# (Perception-encoder and SAM3 are only used behind --run_os; they install
-# unconditionally. Safe to prune later if disk-constrained.)
-echo "--- Installing VGGT-SLAM deps (salad + VGGT_SPARK + gtsam + SAM3 + PE) ---"
+# Upstream extern/vggt_slam/setup.sh installs requirements + salad + VGGT_SPARK
+# fork + perception-encoder + sam3. We inline-reproduce only the parts our
+# pipeline actually uses and skip perception-encoder + SAM3:
+#   - PE and SAM3 are only exercised behind VGGT-SLAM's --run_os flag (CLIP
+#     text-query over the reconstructed map). Our VGGT-SLAM → Boxer path
+#     doesn't touch them — Boxer runs its own OWLv2 2D detector.
+#   - PE pulls `decord==0.6.0`, which has no macOS ARM64 wheel, so installing
+#     it breaks setup on Mac mini. Skipping also saves several GB of disk.
+echo "--- Installing VGGT-SLAM base requirements (torch, open3d, gtsam, viser...) ---"
+pip install -r extern/vggt_slam/requirements.txt
+
+echo "--- Installing salad (DINO-based image retrieval for loop closure) ---"
 pushd extern/vggt_slam >/dev/null
-chmod +x setup.sh
-./setup.sh
+mkdir -p third_party
+if [ ! -d "third_party/salad" ]; then
+    git clone https://github.com/Dominic101/salad.git third_party/salad
+fi
+pip install -e third_party/salad
 popd >/dev/null
 
-echo "--- Installing Boxer ---"
-pushd extern/boxer >/dev/null
-if [ -f "pyproject.toml" ]; then
-    pip install -e .
-elif [ -f "requirements.txt" ]; then
-    pip install -r requirements.txt
+echo "--- Installing VGGT_SPARK (MIT-SPARK's VGGT fork used by VGGT-SLAM) ---"
+pushd extern/vggt_slam >/dev/null
+if [ ! -d "third_party/vggt" ]; then
+    git clone https://github.com/MIT-SPARK/VGGT_SPARK.git third_party/vggt
 fi
+pip install -e third_party/vggt
 popd >/dev/null
+
+echo "--- Installing VGGT-SLAM package ---"
+pip install -e extern/vggt_slam
+
+# Boxer's pyproject.toml ships only lint config, not packaging metadata — it
+# expects to be run from source. We put extern/boxer on sys.path inside
+# pipeline/run_boxer.py, so no pip install needed here.
 
 echo "--- Installing pipeline ---"
 pip install -e .

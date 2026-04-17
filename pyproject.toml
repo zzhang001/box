@@ -1,13 +1,13 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "vggt-boxer-pipeline"
 version = "0.1.0"
-description = "iPhone video → 3D scene graph via VGGT + Boxer (no LiDAR required)"
+description = "iPhone video → 3D scene graph via VGGT-SLAM + Boxer (no LiDAR required)"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 license = {text = "MIT"}
 
 dependencies = [
