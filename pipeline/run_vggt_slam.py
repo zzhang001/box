@@ -111,6 +111,10 @@ def _patch_vggt_slam_for_device(device: str) -> None:
         return model.eval().to(device)
 
     _salad_eval.load_model = _patched_load_model
+    # loop_closure.py did `from salad.eval import load_model`, binding its own
+    # reference at import time. Patching salad.eval after that doesn't update
+    # the local name — we must rebind it directly in the loop_closure namespace.
+    lc.load_model = _patched_load_model
 
     # `solver.run_predictions` does:
     #   dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
