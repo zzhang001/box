@@ -294,8 +294,18 @@ def run_boxer(
               f"inliers={grav_info.get('num_plane_inliers', 0)}")
     else:
         R_align_3 = _R_ALIGN_FALLBACK_3.copy()
+        grav_info = {"method": "fixed_Rx_minus_pi_2"}
         print("[boxer] gravity: fixed Rx(-π/2) (estimate_gravity=False)")
     R_align_4 = _make_R_align_4(R_align_3)
+
+    # Persist the alignment so downstream tools (pipeline.ui) can reproduce
+    # the exact world frame BoxerNet placed its boxes in. Without this, a
+    # viewer that re-estimates gravity from the same VGGT-SLAM output can
+    # get a slightly different rotation (RANSAC is stochastic) and
+    # projected OBBs will visibly drift.
+    import json as _json
+    with open(output_dir / "gravity.json", "w") as f:
+        _json.dump({"R_gravity": R_align_3.tolist(), **grav_info}, f, indent=2)
 
     # Load OWLv2 (text encoder + vision detector). Text prompts are encoded and
     # cached internally.
