@@ -30,12 +30,19 @@ import torch
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _VGGT_SLAM_DIR = _REPO_ROOT / "extern" / "vggt_slam"
+_THIRD_PARTY = _VGGT_SLAM_DIR / "third_party"
 
-# Make extern/vggt_slam importable. Its setup.sh installs a fork of VGGT and salad
-# into `extern/vggt_slam/third_party/{vggt,salad}` as editable pip packages, so
-# those resolve through site-packages rather than sys.path hacks.
-if str(_VGGT_SLAM_DIR) not in sys.path:
-    sys.path.insert(0, str(_VGGT_SLAM_DIR))
+# Put third-party packages on sys.path directly. Upstream installs them as
+# PEP-660 editable wheels (`.pth` files starting with `__editable__...`),
+# but Homebrew's Python 3.11 `site.py` treats `__...` as hidden and skips
+# them, so the editable install never activates. Explicitly adding the
+# source directories sidesteps that — each package's top-level layout is
+# {third_party,}/{salad,vggt}/{salad,vggt}/, so we point sys.path at the
+# outer directory that contains the actual Python package.
+for _path in (_VGGT_SLAM_DIR, _THIRD_PARTY / "salad", _THIRD_PARTY / "vggt"):
+    s = str(_path)
+    if s not in sys.path:
+        sys.path.insert(0, s)
 
 
 @dataclass
