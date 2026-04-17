@@ -73,13 +73,60 @@ def _detect_device() -> str:
 
 
 def _patch_vggt_slam_for_device(device: str) -> None:
-    """VGGT-SLAM hardcodes `device = 'cuda'` in a couple of spots.
+    """VGGT-SLAM + salad hardcode 'cuda' in several spots.
 
     Called once before instantiating `Solver`, we override those module-level
     globals so the image-retrieval branch + VGGT inference use the chosen device.
+
+    Specifically:
+      - `vggt_slam.loop_closure.device` — module global used to move inputs.
+      - `salad.eval.load_model` — bare `torch.load(ckpt_path)` + `.to('cuda')`
+        that crashes on Mac. Replace with a device-aware version.
+      - `solver.run_predictions` calls `torch.cuda.get_device_capability()`
+        which AssertErrors on non-CUDA; patch the dtype logic too.
     """
     import vggt_slam.loop_closure as lc
     lc.device = device
+
+    import salad.eval as _salad_eval
+    from salad.vpr_model import VPRModel
+
+    def _patched_load_model(ckpt_path: str):
+        model = VPRModel(
+            backbone_arch='dinov2_vitb14',
+            backbone_config={
+                'num_trainable_blocks': 4,
+                'return_token': True,
+                'norm_layer': True,
+            },
+            agg_arch='SALAD',
+            agg_config={
+                'num_channels': 768,
+                'num_clusters': 64,
+                'cluster_dim': 128,
+                'token_dim': 256,
+            },
+        )
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        return model.eval().to(device)
+
+    _salad_eval.load_model = _patched_load_model
+
+    # `solver.run_predictions` does:
+    #   dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    # which AssertionErrors without CUDA. Shim torch.cuda.get_device_capability
+    # to return (0, 0) on non-CUDA so the expression falls through to float16,
+    # but we don't actually use autocast in that branch (main.py gates it on
+    # device == 'cuda'). The Solver still evaluates the expression unconditionally.
+    if device != "cuda":
+        import torch as _torch
+        _orig_caps = _torch.cuda.get_device_capability
+        def _safe_caps(*a, **kw):
+            try:
+                return _orig_caps(*a, **kw)
+            except Exception:
+                return (0, 0)
+        _torch.cuda.get_device_capability = _safe_caps
 
 
 def run_vggt_slam(

@@ -66,6 +66,17 @@ popd >/dev/null
 echo "--- Installing VGGT-SLAM package ---"
 pip install -e extern/vggt_slam
 
+# salad/eval.py's load_model reads dino_salad.ckpt from the torch hub cache
+# and does NOT auto-download. Fetch it up front so first-run SLAM isn't
+# blocked by a missing checkpoint.
+HUB_CACHE="${TORCH_HOME:-$HOME/.cache/torch}/hub/checkpoints"
+mkdir -p "$HUB_CACHE"
+if [ ! -f "$HUB_CACHE/dino_salad.ckpt" ]; then
+    echo "--- Downloading dino_salad.ckpt (~335 MB) ---"
+    curl -L -o "$HUB_CACHE/dino_salad.ckpt" \
+        "https://github.com/serizba/salad/releases/download/v1.0.0/dino_salad.ckpt"
+fi
+
 # Boxer's pyproject.toml ships only lint config, not packaging metadata — it
 # expects to be run from source. We put extern/boxer on sys.path inside
 # pipeline/run_boxer.py, so no pip install needed here.
