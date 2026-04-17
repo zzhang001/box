@@ -420,10 +420,12 @@ if __name__ == "__main__":
     parser.add_argument("--thresh-3d", type=float, default=0.5)
     parser.add_argument("--max-frames", type=int, default=None,
                         help="Cap number of keyframes (for quick smoke tests)")
+    parser.add_argument("--scene-graph", type=Path, default=None,
+                        help="Also write scene_graph.json here (default: <output>/scene_graph.json)")
     args = parser.parse_args()
 
     labels = [s.strip() for s in args.labels.split(",") if s.strip()]
-    run_boxer(
+    out = run_boxer(
         vggt_slam_output_dir=args.vggt_slam,
         output_dir=args.output,
         labels=labels,
@@ -432,3 +434,10 @@ if __name__ == "__main__":
         thresh_3d=args.thresh_3d,
         max_frames=args.max_frames,
     )
+
+    # Also emit scene_graph.json for a self-contained CLI run.
+    from pipeline.export import export_scene_graph
+
+    scene_graph_path = args.scene_graph or (args.output / "scene_graph.json")
+    n_frames = len(out.raw_boxes_per_frame)
+    export_scene_graph(out, scene_graph_path, source_video="", num_frames=n_frames)
