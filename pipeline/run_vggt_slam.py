@@ -18,6 +18,12 @@ Notes:
 """
 
 import os
+# PyTorch decides whether the MPS CPU-fallback is allowed when the MPS
+# dispatcher initializes (during `import torch`). Setting this env var after
+# `import torch` is silently ignored, so we set it unconditionally at the top
+# of the module. It has no effect on CUDA / CPU runs.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import sys
 import time
 from pathlib import Path
@@ -70,15 +76,6 @@ def _detect_device() -> str:
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
-
-
-def _enable_mps_fallback_if_needed(device: str) -> None:
-    """VGGT uses a handful of ops (e.g. upsample_bicubic2d) that MPS doesn't
-    implement yet. Opt in to PyTorch's CPU-fallback behavior so those ops run
-    transparently instead of raising NotImplementedError. Must be set before
-    the first MPS op executes — we invoke this at the top of run_vggt_slam()."""
-    if device == "mps":
-        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 
 def _patch_vggt_slam_for_device(device: str) -> None:
@@ -175,7 +172,6 @@ def run_vggt_slam(
     device = device or _detect_device()
     print(f"[vggt-slam] device = {device}")
 
-    _enable_mps_fallback_if_needed(device)
     _patch_vggt_slam_for_device(device)
 
     # Imports must follow the device patch so `lc.device` is the right value
