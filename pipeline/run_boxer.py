@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 import torch
 
+from pipeline.gravity import estimate_gravity_rotation
 from pipeline.run_vggt_slam import VGGTSLAMOutput, load_vggt_slam_output
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -78,17 +79,22 @@ class BoxerOutput:
 # --------------------------------------------------------------------------
 
 
-# Rotation taking VGGT's Y-down world to Boxer's Z-down world. Apply to every
-# pose and every world-frame point before feeding Boxer.
-# Rx(-π/2) maps (x, y, z) → (x, -z, y) so Y_world_vggt ([0,1,0]) → [0,0,-1].
-_R_ALIGN_3 = np.array(
+# Fallback rotation taking VGGT's Y-down world to Boxer's Z-down world when
+# gravity estimation is disabled or fails. Rx(-π/2) maps (x,y,z) → (x,-z,y)
+# so Y_world_vggt ([0,1,0]) → [0,0,-1]. `run_boxer()` can override this per
+# call with an estimate from floor-plane RANSAC (pipeline.gravity).
+_R_ALIGN_FALLBACK_3 = np.array(
     [[1, 0, 0],
      [0, 0, 1],
      [0, -1, 0]],
     dtype=np.float32,
 )
-_R_ALIGN_4 = np.eye(4, dtype=np.float32)
-_R_ALIGN_4[:3, :3] = _R_ALIGN_3
+
+
+def _make_R_align_4(R3: np.ndarray) -> np.ndarray:
+    R4 = np.eye(4, dtype=np.float32)
+    R4[:3, :3] = R3.astype(np.float32)
+    return R4
 
 
 def _invert_extrinsic_3x4(extr: np.ndarray) -> np.ndarray:
@@ -146,8 +152,15 @@ def _build_datum(
     vggt_out: VGGTSLAMOutput,
     frame_idx: int,
     boxer_hw: int,
+    R_align_3: np.ndarray,
+    R_align_4: np.ndarray,
 ):
     """Build a Boxer datum dict for one VGGT-SLAM keyframe.
+
+    `R_align_3` / `R_align_4` are the gravity-alignment rotations taking
+    VGGT-SLAM's world frame into Boxer's Z-down world. Supplied by the
+    caller so the same one is used across all frames (estimated once per
+    video via floor-plane RANSAC or fallback Rx(-π/2)).
 
     Returns (datum, img_bgr_cv2) — img_bgr_cv2 is handy for OWL visualization.
     """
@@ -179,14 +192,14 @@ def _build_datum(
     # 3. Pose: invert extrinsic → T_world_camera, then apply gravity alignment.
     extr = vggt_out.extrinsic[frame_idx].numpy().astype(np.float32)
     T_wc = _invert_extrinsic_3x4(extr)
-    T_wc_aligned = _R_ALIGN_4 @ T_wc
+    T_wc_aligned = R_align_4 @ T_wc
     R = torch.from_numpy(T_wc_aligned[:3, :3].copy())
     t = torch.from_numpy(T_wc_aligned[:3, 3].copy())
     T_world_rig0 = PoseTW.from_Rt(R, t)
 
     # 4. Semi-dense points: pre-rotate to Boxer world frame, confidence filter.
     wp = vggt_out.world_points[frame_idx].numpy().astype(np.float32)   # [H, W, 3]
-    wp_aligned = wp @ _R_ALIGN_3.T                                      # rotate into Z-down world
+    wp_aligned = wp @ R_align_3.T                                       # rotate into Z-down world
     conf = vggt_out.world_points_conf[frame_idx].numpy().astype(np.float32)
     sdp_w = _sample_sdp_from_world_points(wp_aligned, conf, num_samples=10000)
 
@@ -236,6 +249,7 @@ def run_boxer(
     num_sdp_samples: int = 10000,
     ckpt_path: Optional[Path] = None,
     max_frames: Optional[int] = None,
+    estimate_gravity: bool = True,
 ) -> BoxerOutput:
     """Run OWLv2 + BoxerNet on a cached VGGT-SLAM output.
 
@@ -250,6 +264,9 @@ def run_boxer(
         num_sdp_samples: semi-dense points fed to BoxerNet per frame.
         ckpt_path: override BoxerNet checkpoint path.
         max_frames: cap keyframes processed (for quick runs).
+        estimate_gravity: if True (default), fit the world floor plane via
+            RANSAC and use its normal for gravity alignment. Falls back to the
+            fixed Rx(-π/2) if the fit is unreliable.
     """
     from boxernet.boxernet import BoxerNet
     from owl.owl_wrapper import OwlWrapper
@@ -268,6 +285,17 @@ def run_boxer(
     if max_frames is not None:
         n_keyframes = min(n_keyframes, max_frames)
     print(f"[boxer] {n_keyframes} keyframes from {vggt_slam_output_dir}")
+
+    # Estimate gravity-aligning rotation once for the whole video.
+    if estimate_gravity:
+        R_align_3, grav_info = estimate_gravity_rotation(vggt_out)
+        print(f"[boxer] gravity: method={grav_info['method']} "
+              f"tilt_correction={grav_info.get('tilt_correction_deg', 0):.2f}° "
+              f"inliers={grav_info.get('num_plane_inliers', 0)}")
+    else:
+        R_align_3 = _R_ALIGN_FALLBACK_3.copy()
+        print("[boxer] gravity: fixed Rx(-π/2) (estimate_gravity=False)")
+    R_align_4 = _make_R_align_4(R_align_3)
 
     # Load OWLv2 (text encoder + vision detector). Text prompts are encoded and
     # cached internally.
@@ -299,7 +327,7 @@ def run_boxer(
 
     t0 = time.time()
     for i in range(n_keyframes):
-        datum, _img_bgr = _build_datum(vggt_out, i, boxer_hw)
+        datum, _img_bgr = _build_datum(vggt_out, i, boxer_hw, R_align_3, R_align_4)
 
         # OWLv2 expects input in [0, 255].
         img_torch_255 = datum["img0"].clone() * 255.0
