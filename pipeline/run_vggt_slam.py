@@ -192,9 +192,15 @@ def run_vggt_slam(
     model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
     model.eval()
 
-    # bfloat16 is fastest on Ampere+/MPS; CPU also supports bfloat16 though
-    # inference will be painfully slow.
-    model = model.to(torch.bfloat16).to(device)
+    # bfloat16 is fastest on CUDA Ampere+ / MPS (Apple Silicon ALSO supports
+    # bf16 via AMX, but *torch.compile is required* to hit AMX — without it,
+    # PyTorch CPU bf16 falls back to a scalar reference that's 10-100× slower
+    # than fp32. So on CPU we keep fp32; on CUDA/MPS we use bf16.
+    if device == "cpu":
+        model = model.to(torch.float32)
+    else:
+        model = model.to(torch.bfloat16)
+    model = model.to(device)
 
     # Glob frames the same way main.py does.
     import glob
