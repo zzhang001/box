@@ -13,6 +13,9 @@ output/
 *.pt
 *.pth
 
+# Local test data (never commit — may contain private iPhone footage / proprietary bags)
+test/
+
 # Model weights (downloaded at runtime)
 model_cache/
 

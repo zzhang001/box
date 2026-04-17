@@ -4,3 +4,6 @@
 [submodule "extern/boxer"]
 	path = extern/boxer
 	url = https://github.com/facebookresearch/boxer.git
+[submodule "extern/vggt_slam"]
+	path = extern/vggt_slam
+	url = https://github.com/MIT-SPARK/VGGT-SLAM.git
