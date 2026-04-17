@@ -234,6 +234,25 @@ Our VGGT-SLAM output supplies exactly the geometric inputs BoxerNet needs:
 
 All three checkpoints land in `extern/boxer/ckpts/` via `extern/boxer/scripts/download_ckpts.sh`. `BoxerNet.load_from_checkpoint` wires BoxerNet and DINOv3 together; OWLv2 is loaded independently by `OwlWrapper`.
 
+### Post-processing: fusion vs. tracking
+
+BoxerNet runs **independently on every keyframe** — so if the same physical chair is visible in 20 frames, you get 20 slightly-different 3D boxes for it (viewpoint noise, partial occlusion, OWL bbox jitter). Boxer ships two post-processing tools to collapse those redundant predictions:
+
+**Offline fusion — `utils/fuse_3d_boxes.py`.** The right tool for **static scenes** (rooms, furniture, our iPhone clip). Runs *after* all frames are processed, reads the per-frame CSV, and:
+1. Builds a **3D IoU graph** — boxes are nodes; an edge connects any two whose 3D IoU exceeds `iou_threshold` (default 0.3).
+2. Extracts **connected components** — each component is one physical object.
+3. Filters components with fewer than `min_detections` frames (default 4) to drop one-shot false positives.
+4. Within each component, computes a **confidence- and variance-weighted mean** of center, size, and yaw (quaternion slerp for orientation).
+5. Writes one fused row per cluster.
+
+Net effect: 20 noisy chair detections → 1 crisper chair box with tighter estimates.
+
+**Online tracking — `utils/track_3d_boxes.py`.** The right tool for **videos with moving objects** (robot navigation). Processes frames in temporal order, maintaining a set of active Kalman-filtered tracks. Each new 3D box is matched to an existing track by 3D IoU; unmatched boxes start new tracks; tracks that disappear for too long are terminated. Think SORT extended to 3D.
+
+**Why can't fusion do tracking's job?** Offline fusion ignores time — it clusters boxes by spatial overlap regardless of when they were seen. That's wrong for moving objects (a chair pushed across the room would look like two separate clusters). Conversely, tracking ignores non-active tracks — if a chair leaves the frame and reappears 200 frames later, online tracking treats it as two different chairs.
+
+We default to **fusion** for the iPhone room-scan pipeline; `--track` is planned for the ROS2 robot path.
+
 ---
 
 ## Project Structure
