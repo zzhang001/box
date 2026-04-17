@@ -1,4 +1,16 @@
-"""Run VGGT inference to produce camera poses, depth, and point clouds."""
+"""Run VGGT inference to produce camera poses, depth, and point clouds.
+
+NOTE on the "vggt" namespace: both this file and `run_vggt_slam.py` want to
+import a package called `vggt`, but they point at different versions:
+
+  - run_vggt.py → extern/vggt (facebookresearch/vggt)
+  - run_vggt_slam.py → MIT-SPARK VGGT fork, installed via pip editable from
+    extern/vggt_slam/third_party/vggt
+
+We defer the sys.path manipulation to `run_vggt()` (not at module load) so
+that loading this module for the VGGTOutput dataclass alone — e.g. from
+convert.py — doesn't shadow the pip-installed fork that VGGT-SLAM relies on.
+"""
 
 import sys
 from pathlib import Path
@@ -6,9 +18,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-
-# Ensure extern/vggt is importable
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "extern" / "vggt"))
 
 
 @dataclass
@@ -40,6 +49,12 @@ def run_vggt(
     Returns:
         VGGTOutput with poses, depth, and point clouds.
     """
+    # Add extern/vggt to sys.path only when actually invoking this front-end,
+    # to avoid shadowing the MIT-SPARK fork that VGGT-SLAM pip-installs.
+    _vggt_dir = Path(__file__).resolve().parent.parent / "extern" / "vggt"
+    if str(_vggt_dir) not in sys.path:
+        sys.path.insert(0, str(_vggt_dir))
+
     from vggt.models.vggt import VGGT
     from vggt.utils.load_fn import load_and_preprocess_images
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
