@@ -283,6 +283,68 @@ VGGT's `fx` is **+26% larger** than reality. Equivalent statement: VGGT thinks t
 
 **Why we didn't just do this from the start.** VGGT-SLAM's upstream assumes full end-to-end RGB → (K, depth, pose). Pulling `K` out of EXIF breaks that symmetry for only one camera family. It's the right thing for our iPhone path, but not a general replacement — the override is gated behind a CLI flag.
 
+### Diagnostic metrics: three orthogonal geometric checks
+
+We have **no ground-truth 3D annotations** for an iPhone scan, so to judge box quality we compute three metrics per OBB that each catch a different failure mode (implemented in [pipeline/diagnostic.py](pipeline/diagnostic.py)):
+
+#### A. `dist_to_cloud` — does the box live in the scene at all?
+
+For each 3D box, distance from its center to the nearest point in the VGGT-SLAM fused cloud.
+
+```
+dist = min_{p ∈ scene_cloud} ‖ box_center − p ‖
+```
+
+- **Proxy for "is the box near any real surface?"** Correct boxes land inside or very close to the actual room geometry, because real objects have surface points captured by VGGT.
+- Cheap: 50-80k point KD-style brute force over our ~1k detections.
+- **Catches**: boxes floating in empty space (screenshot-visible outliers — cyan box far from room).
+- **Misses**: boxes at roughly-right angular direction but wrong depth (can still be close to some cloud point).
+
+#### B. `iou2d` — is the 3D box self-consistent with (K, pose)?
+
+Project the 3D box's 8 corners into the native image using the same K and pose BoxerNet saw. Take the axis-aligned 2D bounding box of the projected corners. Compute IoU with the OWL 2D bbox that prompted BoxerNet.
+
+```
+corners_cam  = T_cw · corners_world                  # 8 × 3
+uv           = project(corners_cam, K)               # 8 × 2
+projected_bb = [uv.min(0), uv.max(0)] flattened      # axis-aligned xyxy
+iou2d        = IoU(projected_bb, owl_prompt_bbox)    # scalar in [0, 1]
+```
+
+- **Purely geometric**, no ground truth needed. Tests the self-consistency of (K, pose, 3D position).
+- **Catches**: K overestimation, pose errors, or box placed at wrong 3D direction — all of which make the reprojection miss the 2D bbox region.
+- **Misses**: a box at the right angular direction but scaled too large/small along the ray (the 2D footprint still overlaps well).
+- Requires recovering the OWL-bbox ↔ BoxerNet-output correspondence that's lost after `thresh_3d` filtering. We reconstruct it by nearest-projected-center within the same label class.
+
+#### C. `depth_gap` — is the box at the same depth as what VGGT sees in that bbox?
+
+Project VGGT's semi-dense world points into the native image. Keep those landing inside the OWL 2D bbox. Compute their camera-frame Z distribution (q10/q50/q90). Compare with the camera-frame Z range spanned by the box's 8 corners.
+
+```
+sdp_z_in_bbox = [z for p ∈ VGGT_points
+                 if owl_bbox contains project(p, K, pose)]
+depth_gap = max(0, min_box_z − q90(sdp_z_in_bbox),    # box in front of cloud
+                     q10(sdp_z_in_bbox) − max_box_z)  # box behind cloud
+```
+
+- Zero if the box's depth interval overlaps with where VGGT sees the object's surface. Positive = gap in meters.
+- **Catches** exactly the "angular direction right, distance wrong" failure mode that A and B can both miss. This is the specific failure expected from systematic K bias or SL(4) scale drift, so it's the most sensitive metric for our current hypothesis.
+- Requires enough VGGT points inside the bbox (default ≥30 points after 70th-percentile confidence filter) to be meaningful.
+
+#### Combining the three
+
+We flag a box as bad if *any* metric exceeds its threshold, e.g.:
+
+```
+dist_to_cloud > 0.8 m  OR  iou2d < 0.05  OR  depth_gap > 0.5 m
+```
+
+`pipeline.diagnostic --filter` writes a filtered CSV that `pipeline.fuse` can then consume to produce a cleaner scene graph. The thresholds above are defaults; tune via CLI flags.
+
+#### What's still missing
+
+None of these metrics verify **absolute metric scale** (e.g., is the box actually 47 cm wide in the real world?). For that we'd need either a ruler/checkerboard in the scene or an Apple Depth Pro-style metric depth reference. The current metrics only verify **self-consistency between BoxerNet's output and the (K, pose, SDP) geometry we fed it**.
+
 ---
 
 ## Project Structure
