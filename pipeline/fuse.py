@@ -6,6 +6,10 @@ Wraps `extern/boxer/utils/fuse_3d_boxes.fuse_obbs_from_csv`:
   3. Drop clusters with fewer than `min_detections` frames.
   4. Produce one confidence/variance-weighted OBB per cluster.
   5. Write a fused CSV + a scene_graph.json built from the fused OBBs.
+  6. (NEW) Post-filter fused objects against the VGGT scene cloud —
+     drop any fused box whose corners are predominantly in empty
+     space (cluster mean of per-frame detections can land off-cloud
+     even if individual detections passed the per-frame filter).
 
 See README's "Post-processing: fusion vs. tracking" section for the
 motivation and how this differs from online tracking.
@@ -26,6 +30,47 @@ if str(_BOXER_DIR) not in sys.path:
     sys.path.insert(0, str(_BOXER_DIR))
 
 
+def _post_filter_against_cloud(
+    objects: list[dict],
+    cloud_sample: "np.ndarray",
+    *,
+    max_corner_dist: float = 0.4,    # meters — any corner farther than this = "in empty space"
+    max_off_cloud_fraction: float = 0.5,  # drop if > half the corners are "in empty space"
+) -> tuple[list[dict], list[dict]]:
+    """Drop fused objects whose corners mostly land in empty space.
+
+    Cluster means are vulnerable to an averaging artifact: each per-frame
+    detection individually passes the per-frame dist-to-cloud filter, but
+    their mean can still land in an empty region if the cluster has large
+    spatial variance (common when a label is detected across multiple
+    nearby objects and fusion over-merges them). A per-corner cloud check
+    catches this because a big, wrongly-placed fused box will have many
+    corners far from any real surface.
+
+    Returns (kept, dropped). Both are lists of the same object dicts.
+    """
+    import numpy as np
+    kept, dropped = [], []
+    for obj in objects:
+        center = np.array(obj["center"], dtype=np.float32)
+        size = np.array(obj["size"], dtype=np.float32)
+        # Axis-aligned 8 corners from size; orientation negligible for a
+        # coarse "does this enclose any real geometry?" test.
+        hx, hy, hz = size / 2.0
+        corners = center[None, :] + np.array([
+            [-hx, -hy, -hz], [+hx, -hy, -hz], [+hx, +hy, -hz], [-hx, +hy, -hz],
+            [-hx, -hy, +hz], [+hx, -hy, +hz], [+hx, +hy, +hz], [-hx, +hy, +hz],
+        ], dtype=np.float32)
+        dists = np.linalg.norm(cloud_sample[None, :, :] - corners[:, None, :], axis=2).min(axis=1)
+        off_cloud = (dists > max_corner_dist).mean()
+        if off_cloud > max_off_cloud_fraction:
+            dropped.append({**obj, "_off_cloud_fraction": float(off_cloud),
+                            "_max_corner_dist": float(dists.max())})
+        else:
+            kept.append(obj)
+    return kept, dropped
+
+
 def fuse_csv(
     input_csv: Path,
     output_csv: Optional[Path] = None,
@@ -34,8 +79,16 @@ def fuse_csv(
     iou_threshold: float = 0.3,
     min_detections: int = 4,
     conf_threshold: float = 0.55,
+    post_filter_vggt_slam_dir: Optional[Path] = None,
+    post_filter_max_corner_dist: float = 0.4,
+    post_filter_max_off_cloud_fraction: float = 0.5,
 ) -> tuple[Path, list[dict]]:
     """Fuse per-frame CSV → per-object CSV + scene graph.
+
+    If `post_filter_vggt_slam_dir` is supplied, each fused object is tested
+    against the VGGT-SLAM cloud at the same gravity-aligned frame. Objects
+    whose corners are predominantly in empty space are dropped from the
+    final scene graph (but retained in the raw fused CSV for inspection).
 
     Returns (fused_csv_path, objects_list).
     """
@@ -57,6 +110,37 @@ def fuse_csv(
 
     # Read the fused CSV back so we can build a scene graph out of it.
     objects = _read_fused_csv(output_csv)
+
+    # Optional post-filter: drop clusters whose corners mostly live in empty
+    # space (averaging artifact — individual detections passed the per-frame
+    # check but their mean landed off-cloud).
+    post_filter_dropped: list[dict] = []
+    if post_filter_vggt_slam_dir is not None:
+        import json as _json
+        import numpy as _np
+        from pipeline.run_vggt_slam import load_vggt_slam_output as _load
+        vggt_out = _load(Path(post_filter_vggt_slam_dir))
+        grav_path = Path(input_csv).parent / "gravity.json"
+        if grav_path.exists():
+            with open(grav_path) as f:
+                R_align = _np.array(_json.load(f)["R_gravity"], dtype=_np.float32)
+        else:
+            R_align = _np.array([[1,0,0],[0,0,1],[0,-1,0]], dtype=_np.float32)
+        pts = vggt_out.world_points.reshape(-1, 3).numpy().astype(_np.float32) @ R_align.T
+        conf = vggt_out.world_points_conf.reshape(-1).numpy().astype(_np.float32)
+        mask = (conf > _np.percentile(conf, 70)) & _np.isfinite(pts).all(axis=1)
+        pts = pts[mask]
+        rng = _np.random.default_rng(0)
+        cloud_sample = pts[rng.choice(pts.shape[0], size=min(80_000, pts.shape[0]), replace=False)]
+        objects, post_filter_dropped = _post_filter_against_cloud(
+            objects, cloud_sample,
+            max_corner_dist=post_filter_max_corner_dist,
+            max_off_cloud_fraction=post_filter_max_off_cloud_fraction,
+        )
+        print(f"[fuse] post-filter: kept {len(objects)}, dropped {len(post_filter_dropped)} fused objects")
+        for d in post_filter_dropped:
+            print(f"  - dropped {d['label']:12s} size={d['size']} "
+                  f"off_cloud_fraction={d['_off_cloud_fraction']:.2f}")
 
     if scene_graph_path is None:
         scene_graph_path = output_csv.with_name("scene_graph_fused.json")
@@ -144,6 +228,11 @@ def main() -> None:
     parser.add_argument("--iou-threshold", type=float, default=0.3)
     parser.add_argument("--min-detections", type=int, default=4)
     parser.add_argument("--conf-threshold", type=float, default=0.55)
+    parser.add_argument("--post-filter-vggt-slam", type=Path, default=None,
+                        help="VGGT-SLAM output dir. If set, drop fused objects "
+                             "whose corners are predominantly in empty space.")
+    parser.add_argument("--post-filter-max-corner-dist", type=float, default=0.4)
+    parser.add_argument("--post-filter-max-off-cloud-fraction", type=float, default=0.5)
     args = parser.parse_args()
 
     _, objects = fuse_csv(
@@ -153,6 +242,9 @@ def main() -> None:
         iou_threshold=args.iou_threshold,
         min_detections=args.min_detections,
         conf_threshold=args.conf_threshold,
+        post_filter_vggt_slam_dir=args.post_filter_vggt_slam,
+        post_filter_max_corner_dist=args.post_filter_max_corner_dist,
+        post_filter_max_off_cloud_fraction=args.post_filter_max_off_cloud_fraction,
     )
     _print_summary(objects)
 
