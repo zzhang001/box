@@ -124,10 +124,18 @@ def _scale_K(K: np.ndarray, src_hw: tuple[int, int], dst_hw: tuple[int, int]) ->
 def _sample_sdp_from_world_points(
     world_points: np.ndarray,      # [H, W, 3] already aligned to Boxer world frame
     conf: np.ndarray,              # [H, W]
-    conf_percentile: float = 50.0,
+    conf_percentile: float = 90.0,
     num_samples: int = 10000,
 ) -> torch.Tensor:
-    """Flatten per-frame world_points, confidence-filter, NaN-pad to fixed count."""
+    """Flatten per-frame world_points, confidence-filter, NaN-pad to fixed count.
+
+    conf_percentile=90 keeps the top 10% of points by VGGT confidence. Tighter
+    than the 50% default: BoxerNet treats SDP as a depth prior, so noisy
+    monocular-depth outliers from low-confidence pixels (surface boundaries,
+    untextured walls, sky) confuse its 3D lifting — especially in submaps
+    where SL(4) scale drift already stresses consistency. Fewer but higher-
+    quality points push BoxerNet toward the correct depth.
+    """
     pts = world_points.reshape(-1, 3)
     c = conf.reshape(-1)
     thresh = float(np.percentile(c, conf_percentile))
