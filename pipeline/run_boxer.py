@@ -151,6 +151,62 @@ def _sample_sdp_from_world_points(
     return sdp
 
 
+def _build_global_sdp(
+    vggt_out: VGGTSLAMOutput,
+    R_align_3: np.ndarray,
+    conf_percentile: float = 90.0,
+    max_points: int = 400_000,
+) -> np.ndarray:
+    """Fuse all per-frame world points into ONE global cloud in Boxer world frame.
+
+    Used with `sdp_mode="global"`: every frame gets the same globally-consistent
+    scene cloud (cropped to its view frustum at datum time). This sidesteps the
+    per-submap SL(4) scale drift problem — instead of each frame carrying its
+    own locally-VGGT depth (which may be at a different scale than the pose),
+    every frame sees the same fused cloud which, once averaged across all
+    submaps, is closer to metric.
+    """
+    pts = vggt_out.world_points.reshape(-1, 3).numpy().astype(np.float32)
+    conf = vggt_out.world_points_conf.reshape(-1).numpy().astype(np.float32)
+    thresh = float(np.percentile(conf, conf_percentile))
+    mask = (conf > thresh) & np.isfinite(pts).all(axis=1)
+    pts = pts[mask]
+    rng = np.random.default_rng(0)
+    if pts.shape[0] > max_points:
+        idx = rng.choice(pts.shape[0], size=max_points, replace=False)
+        pts = pts[idx]
+    return (pts @ R_align_3.T).astype(np.float32)
+
+
+def _crop_global_sdp_to_frustum(
+    global_sdp: np.ndarray,        # [N, 3] in Boxer world frame
+    T_world_camera: np.ndarray,    # [4, 4] in same world
+    K: np.ndarray,                 # [3, 3] for BoxerNet input resolution (hw)
+    hw: int,
+    near: float = 0.1,
+    far: float = 10.0,
+    num_samples: int = 10000,
+) -> torch.Tensor:
+    """Project global SDP into the current camera; keep points inside frustum."""
+    T_cw = np.linalg.inv(T_world_camera)
+    pts_h = np.concatenate([global_sdp, np.ones((global_sdp.shape[0], 1), dtype=np.float32)], axis=1)
+    pts_cam = pts_h @ T_cw.T
+    z = pts_cam[:, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = (pts_cam[:, 0] / z) * K[0, 0] + K[0, 2]
+        v = (pts_cam[:, 1] / z) * K[1, 1] + K[1, 2]
+    in_frustum = (z > near) & (z < far) & (u >= 0) & (u < hw) & (v >= 0) & (v < hw)
+    visible = global_sdp[in_frustum]
+    if visible.shape[0] > num_samples:
+        idx = np.random.choice(visible.shape[0], size=num_samples, replace=False)
+        visible = visible[idx]
+    sdp = torch.from_numpy(visible.astype(np.float32))
+    if sdp.shape[0] < num_samples:
+        pad = torch.full((num_samples - sdp.shape[0], 3), float("nan"), dtype=torch.float32)
+        sdp = torch.cat([sdp, pad], dim=0)
+    return sdp
+
+
 # --------------------------------------------------------------------------
 # Per-frame datum construction
 # --------------------------------------------------------------------------
@@ -162,6 +218,7 @@ def _build_datum(
     boxer_hw: int,
     R_align_3: np.ndarray,
     R_align_4: np.ndarray,
+    global_sdp: Optional[np.ndarray] = None,
 ):
     """Build a Boxer datum dict for one VGGT-SLAM keyframe.
 
@@ -232,11 +289,20 @@ def _build_datum(
     t = torch.from_numpy(T_wc_aligned[:3, 3].copy())
     T_world_rig0 = PoseTW.from_Rt(R, t)
 
-    # 4. Semi-dense points: pre-rotate to Boxer world frame, confidence filter.
-    wp = vggt_out.world_points[frame_idx].numpy().astype(np.float32)   # [H, W, 3]
-    wp_aligned = wp @ R_align_3.T                                       # rotate into Z-down world
-    conf = vggt_out.world_points_conf[frame_idx].numpy().astype(np.float32)
-    sdp_w = _sample_sdp_from_world_points(wp_aligned, conf, num_samples=10000)
+    # 4. Semi-dense points.
+    if global_sdp is not None:
+        # Mode: global — use the scene-wide fused cloud cropped to this camera's
+        # frustum. Every frame sees the same globally-consistent geometry, which
+        # sidesteps per-submap SL(4) scale drift.
+        sdp_w = _crop_global_sdp_to_frustum(
+            global_sdp, T_wc_aligned, K_boxer, hw=boxer_hw, num_samples=10000,
+        )
+    else:
+        # Mode: per-frame — use this frame's VGGT world points after conf filter.
+        wp = vggt_out.world_points[frame_idx].numpy().astype(np.float32)   # [H, W, 3]
+        wp_aligned = wp @ R_align_3.T                                       # rotate into Z-down world
+        conf = vggt_out.world_points_conf[frame_idx].numpy().astype(np.float32)
+        sdp_w = _sample_sdp_from_world_points(wp_aligned, conf, num_samples=10000)
 
     # 5. Misc.
     time_ns = int(vggt_out.frame_ids[frame_idx] * 1_000_000)  # frame_id is float
@@ -285,6 +351,7 @@ def run_boxer(
     ckpt_path: Optional[Path] = None,
     max_frames: Optional[int] = None,
     estimate_gravity: bool = True,
+    sdp_mode: str = "perframe",
 ) -> BoxerOutput:
     """Run OWLv2 + BoxerNet on a cached VGGT-SLAM output.
 
@@ -302,6 +369,11 @@ def run_boxer(
         estimate_gravity: if True (default), fit the world floor plane via
             RANSAC and use its normal for gravity alignment. Falls back to the
             fixed Rx(-π/2) if the fit is unreliable.
+        sdp_mode: "perframe" (default) uses each frame's VGGT world points
+            with tight conf filter — simplest, fastest. "global" fuses all
+            per-frame world points into one globally-consistent cloud and
+            crops it to each frame's view frustum — better at suppressing
+            per-submap SL(4) scale drift at a small compute cost.
     """
     from boxernet.boxernet import BoxerNet
     from owl.owl_wrapper import OwlWrapper
@@ -342,6 +414,17 @@ def run_boxer(
     with open(output_dir / "gravity.json", "w") as f:
         _json.dump({"R_gravity": R_align_3.tolist(), **grav_info}, f, indent=2)
 
+    # Optionally precompute the globally-fused scene cloud (used when
+    # sdp_mode="global"). Expensive for ~300k points, but a one-time cost.
+    global_sdp: Optional[np.ndarray] = None
+    if sdp_mode == "global":
+        global_sdp = _build_global_sdp(vggt_out, R_align_3)
+        print(f"[boxer] sdp_mode=global: {global_sdp.shape[0]} fused points")
+    elif sdp_mode == "perframe":
+        print("[boxer] sdp_mode=perframe (VGGT per-frame points, top 10% conf)")
+    else:
+        raise ValueError(f"Unknown sdp_mode={sdp_mode!r}; use 'perframe' or 'global'")
+
     # Load OWLv2 (text encoder + vision detector). Text prompts are encoded and
     # cached internally.
     print(f"[boxer] loading OWLv2 with {len(labels)} labels: {labels[:8]}{'...' if len(labels) > 8 else ''}")
@@ -372,7 +455,9 @@ def run_boxer(
 
     t0 = time.time()
     for i in range(n_keyframes):
-        datum, _img_bgr = _build_datum(vggt_out, i, boxer_hw, R_align_3, R_align_4)
+        datum, _img_bgr = _build_datum(
+            vggt_out, i, boxer_hw, R_align_3, R_align_4, global_sdp=global_sdp,
+        )
 
         # OWLv2 expects input in [0, 255].
         img_torch_255 = datum["img0"].clone() * 255.0
@@ -493,6 +578,11 @@ if __name__ == "__main__":
     parser.add_argument("--thresh-3d", type=float, default=0.5)
     parser.add_argument("--max-frames", type=int, default=None,
                         help="Cap number of keyframes (for quick smoke tests)")
+    parser.add_argument("--sdp-mode", type=str, default="perframe",
+                        choices=["perframe", "global"],
+                        help="'perframe' (default) uses each frame's VGGT depth; "
+                             "'global' passes the fused scene cloud cropped to "
+                             "the frustum — more robust to per-submap scale drift")
     parser.add_argument("--scene-graph", type=Path, default=None,
                         help="Also write scene_graph.json here (default: <output>/scene_graph.json)")
     args = parser.parse_args()
@@ -506,6 +596,7 @@ if __name__ == "__main__":
         thresh_2d=args.thresh_2d,
         thresh_3d=args.thresh_3d,
         max_frames=args.max_frames,
+        sdp_mode=args.sdp_mode,
     )
 
     # Also emit scene_graph.json for a self-contained CLI run.
