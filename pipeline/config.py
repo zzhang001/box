@@ -3,16 +3,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import torch
-
-
-def _detect_device() -> str:
-    """Auto-detect the best available compute device."""
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+from pipeline._common import detect_device as _detect_device
 
 
 @dataclass

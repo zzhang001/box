@@ -21,6 +21,7 @@ import cv2
 import numpy as np
 import torch
 
+from pipeline._common import detect_device
 from pipeline.run_vggt_slam import load_vggt_slam_output
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -42,12 +43,7 @@ def run_owl_on_keyframes(
     from owl.owl_wrapper import OwlWrapper
 
     if device is None:
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+        device = detect_device()
     print(f"[owl] device={device}")
 
     vggt_out = load_vggt_slam_output(Path(vggt_slam_dir))

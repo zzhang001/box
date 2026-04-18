@@ -70,12 +70,7 @@ class VGGTSLAMOutput:
     frame_ids: list[float]           # [S] numeric IDs parsed from filenames
 
 
-def _detect_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+from pipeline._common import detect_device as _detect_device  # re-export
 
 
 def _patch_vggt_slam_for_device(device: str) -> None:

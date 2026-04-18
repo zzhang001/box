@@ -77,38 +77,65 @@ Frames on disk (frame_%05d.jpg)  — written by ffmpeg at configured fps
              │
              ▼
 ┌─────────────────────────────────────────────────────┐
-│  pipeline/run_boxer.py (per keyframe)                │
+│  pipeline/gravity.py                                │
 │                                                     │
-│  1. Load RGB, resize to 960×960                     │
-│  2. Rotate world frame Y-down → Z-down              │
-│     (all poses + world points by Rx(-π/2))          │
-│  3. Build Boxer datum dict:                         │
-│       img0, cam0 (CameraTW), T_world_rig0 (PoseTW), │
-│       sdp_w (semi-dense points, conf-filtered)      │
-│  4. OWLv2: text prompts → bb2d (x1, x2, y1, y2)     │
-│  5. BoxerNet: datum + bb2d → 3D OBBs in world frame │
+│  Floor-plane RANSAC on fused VGGT points →          │
+│    R_align: VGGT Y-down world → Boxer Z-down world  │
+│  Falls back to fixed Rx(-π/2) if fit is weak        │
 └────────────┬────────────────────────────────────────┘
              │
              ▼
 ┌─────────────────────────────────────────────────────┐
-│  pipeline/export.py                                  │
+│  pipeline/run_boxer.py (per keyframe)                │
 │                                                     │
-│  scene_graph.json:                                  │
+│  1. Load RGB → pad to square → resize to 960×960    │
+│  2. Build K (iPhone EXIF override if --override-k-  │
+│     from-mov; else VGGT's estimate scaled to 960)   │
+│  3. Rescale VGGT world_points for K consistency     │
+│  4. Build datum: img0, cam0, T_world_rig0, sdp_w    │
+│     sdp_mode=global → fused cloud cropped to        │
+│     frustum (default; avoids per-submap scale drift)│
+│  5. OWLv2: text prompts → bb2d                      │
+│  6. BoxerNet: datum + bb2d → 3D OBBs in world       │
+│  Writes: boxer_3dbbs.csv, gravity.json              │
+└────────────┬────────────────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────────────────┐
+│  pipeline/diagnostic.py (per-box quality filter)    │
+│                                                     │
+│  Computes 3 orthogonal metrics per OBB:             │
+│    A. dist_to_cloud (box center vs scene cloud)     │
+│    B. iou2d        (project 3D box vs OWL bbox)     │
+│    C. depth_gap    (box Z vs VGGT depth in bbox)    │
+│                                                     │
+│  --filter drops boxes exceeding any threshold       │
+│  Output: boxer_3dbbs_filtered.csv                   │
+└────────────┬────────────────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────────────────┐
+│  pipeline/fuse.py (per-frame → canonical objects)   │
+│                                                     │
+│  1. 3D-IoU graph clustering + connected components  │
+│  2. Weighted-mean per cluster (conf + logvar)       │
+│  3. Post-filter against cloud: drop fused boxes     │
+│     whose corners are mostly in empty space         │
+│                                                     │
+│  Output: scene_graph_filtered_fused.json            │
 │  {                                                  │
-│    "objects": [                                      │
-│      {                                              │
-│        "label": "chair",                            │
-│        "center": [x, y, z],                         │
-│        "size": [w, h, d],                           │
-│        "yaw": 1.23,                                 │
-│        "confidence": 0.92,                          │
-│        "uncertainty": 0.05                          │
-│      }, ...                                         │
+│    "objects": [                                     │
+│      { "label": "chair", "center": [x,y,z],         │
+│        "size": [w,h,d], "yaw": 1.23, ... }, ...     │
 │    ],                                               │
 │    "coordinate_system": "gravity_aligned_metric",   │
 │    "up_axis": "Z"                                   │
 │  }                                                  │
-└─────────────────────────────────────────────────────┘
+└────────────┬────────────────────────────────────────┘
+             │
+             ▼
+     pipeline/ui.py (interactive rerun viewer)
+     or pipeline/visualize.py (static PLY)
 ```
 
 ### Key Coordinate Conversions
@@ -362,12 +389,19 @@ box/
 │
 ├── pipeline/
 │   ├── __init__.py
+│   ├── _common.py              # Shared constants: R_ALIGN_FALLBACK, detect_device
 │   ├── config.py               # PipelineConfig dataclass
 │   ├── extract_frames.py       # ffmpeg: video → frames
 │   ├── run_vggt_slam.py        # VGGT-SLAM 2.0 inference wrapper
+│   ├── gravity.py              # Floor-plane RANSAC → Z-down world alignment
+│   ├── iphone_k.py             # Parse iPhone MOV EXIF → real camera K
+│   ├── save_owl_bbs.py         # OWLv2 only, dumps per-frame 2D bboxes JSON
 │   ├── run_boxer.py            # Boxer (OWLv2 + BoxerNet) inference wrapper
-│   ├── visualize.py            # VGGT-SLAM output → fused PLY
+│   ├── diagnostic.py           # Three geometric quality metrics + filter
+│   ├── fuse.py                 # Offline 3D-box fusion + corner-check post-filter
 │   ├── export.py               # 3D boxes → scene_graph.json
+│   ├── visualize.py            # VGGT-SLAM output → fused PLY (for MeshLab)
+│   ├── ui.py                   # Rerun-based live viewer (2D + 3D synced)
 │   └── run.py                  # End-to-end orchestrator
 │
 └── test/                       # Local iPhone footage (gitignored — never committed)
@@ -420,30 +454,68 @@ python -m pipeline.run \
     --device cpu                                  # Mac mini: no CUDA
 ```
 
-### Step-by-Step
+### Step-by-Step (full quality pipeline)
+
+The one-liner `pipeline.run` does extraction → SLAM → Boxer → export, but for iPhone clips the best results come from running the full filter + fusion chain explicitly:
 
 ```bash
-# 1. Extract frames
+# 1. Extract frames (ffmpeg, 12 fps).
 python -m pipeline.extract_frames --video input.mov --output output/frames/ --fps 12
 
-# 2. Run VGGT-SLAM
+# 2. VGGT-SLAM (slow; ~30-60 min on Mac mini CPU for a 30-sec clip).
 python -m pipeline.run_vggt_slam --frames output/frames/ --output output/vggt_slam/
 
-# 3. Run Boxer (OWLv2 + BoxerNet) on the cached VGGT-SLAM output
+# 3. OWLv2 pass for the UI's 2D-bbox overlay (Boxer runs OWL internally,
+#    but it doesn't persist the boxes — this saves them for replay).
+python -m pipeline.save_owl_bbs \
+    --vggt-slam output/vggt_slam/ \
+    --output output/boxer/owl_2dbbs.json \
+    --labels "chair,table,sofa,monitor,laptop,keyboard,lamp,plant,bookshelf,cabinet,fridge,oven,sink,microwave"
+
+# 4. Boxer with iPhone K override + global SDP (best config on iPhone data).
 python -m pipeline.run_boxer \
     --vggt-slam output/vggt_slam/ \
     --output output/boxer/ \
-    --labels "chair,table,desk,monitor,keyboard"
+    --labels "chair,table,sofa,monitor,laptop,keyboard,lamp,plant,bookshelf,cabinet,fridge,oven,sink,microwave" \
+    --sdp-mode global \
+    --override-k-from-mov input.mov
 
-# 4. Export scene graph JSON (optional; pipeline.run does this automatically)
-python -m pipeline.export --boxer-output output/boxer/ --output scene_graph.json
+# 5. Diagnostic filter (drops boxes failing any of dist-to-cloud / IoU / depth-gap).
+python -m pipeline.diagnostic \
+    --vggt-slam output/vggt_slam/ \
+    --boxer-csv output/boxer/boxer_3dbbs.csv \
+    --owl-json output/boxer/owl_2dbbs.json \
+    --out output/boxer/diagnostic \
+    --override-k-from-mov input.mov \
+    --filter --max-dist-to-cloud 0.5 --min-iou2d 0.3 --max-depth-gap 0.3
+
+# 6. Fuse per-frame detections into canonical objects + drop off-cloud phantoms.
+python -m pipeline.fuse \
+    --input output/boxer/boxer_3dbbs_filtered.csv \
+    --output-csv output/boxer/boxer_3dbbs_filtered_fused.csv \
+    --scene-graph output/boxer/scene_graph_filtered_fused.json \
+    --post-filter-vggt-slam output/vggt_slam/
+
+# 7. Interactive viewer (opens a Rerun window).
+python -m pipeline.ui \
+    --vggt-slam output/vggt_slam/ \
+    --boxer-csv output/boxer/boxer_3dbbs_filtered.csv \
+    --owl-json output/boxer/owl_2dbbs.json \
+    --scene-graph output/boxer/scene_graph_filtered_fused.json \
+    --save-rrd output/box_ui.rrd && rerun output/box_ui.rrd
 ```
 
-### Visualizing the fused point cloud
+### Visualizing the fused point cloud as a static PLY
 
 ```bash
-# Produces output/vggt_slam/fused.ply — openable in MeshLab / CloudCompare / 3dviewer.net
+# For MeshLab / CloudCompare / 3dviewer.net
 python -m pipeline.visualize --input output/vggt_slam/ --output output/vggt_slam/fused.ply
+
+# Overlay the fused 3D boxes too (colored wireframes)
+python -m pipeline.visualize \
+    --input output/vggt_slam/ \
+    --scene-graph output/boxer/scene_graph_filtered_fused.json \
+    --output output/vggt_slam/fused_with_boxes.ply
 ```
 
 ### Tips for capturing a good iPhone clip
@@ -530,15 +602,22 @@ We keep VGGT in **fp32 on CPU** (not bf16) because Apple Silicon NEON lacks hard
 
 ## Roadmap
 
-- [x] VGGT-SLAM 2.0 wrapper on Mac mini (CPU fp32 validated end-to-end; 471 frames → 223 keyframes)
-- [x] OWLv2 + BoxerNet wired in, per-keyframe 3D boxes
-- [ ] End-to-end validation on `test/IMG_6826.MOV` with visual inspection
-- [ ] Offline 3D-box fusion via `extern/boxer/utils/fuse_3d_boxes.py`
-- [ ] Gravity estimation from iPhone IMU / floor-plane RANSAC (replace the fixed `Rx(-π/2)`)
+**Done** (v0.4-post-filter):
+- [x] VGGT-SLAM 2.0 wrapper on Mac mini (CPU fp32; 471 frames → 223 keyframes, 16 submaps, 2 loop closures)
+- [x] OWLv2 + BoxerNet wired in via `pipeline.run_boxer` with pad-to-square K fix
+- [x] Floor-plane RANSAC gravity alignment (`pipeline.gravity`)
+- [x] iPhone K override from MOV EXIF (`pipeline.iphone_k`) — 26% VGGT K error corrected
+- [x] `sdp_mode=global` to sidestep per-submap SL(4) scale drift
+- [x] Three geometric diagnostic metrics + threshold filter (`pipeline.diagnostic`)
+- [x] Offline 3D-box fusion + corner-check post-filter (`pipeline.fuse`)
+- [x] Rerun-based interactive viewer (`pipeline.ui`)
+- [x] End-to-end validation on `test/IMG_6826.MOV`: 33 fused objects with plausible sizes + placements
+
+**Next**:
+- [ ] Try Apple Depth Pro (known K input + metric depth) to replace VGGT depth for Boxer's SDP, compare against v0.4 baseline
 - [ ] Post-hoc Euclidean rectification of SL(4)-warped world
-- [ ] Fix VGGT-SLAM MPS device-mismatch for Apple Silicon acceleration
-- [ ] Interactive 3D visualization (rerun.io or viser)
-- [ ] Streaming mode
+- [ ] Fix VGGT-SLAM MPS device mismatch for Apple Silicon acceleration (currently CPU fp32 only)
+- [ ] Streaming / online mode
 - [ ] ROS2 bridge
 
 ---

@@ -38,17 +38,12 @@ from typing import Optional
 
 import numpy as np
 
+from pipeline._common import R_ALIGN_FALLBACK
 from pipeline.run_vggt_slam import VGGTSLAMOutput
 
 
 # Initial guess: Rx(-π/2) maps VGGT's Y-down world to Boxer's Z-down world.
-# Kept here (and not imported from run_boxer) so gravity.py has no back-edge.
-_R_INITIAL_GUESS = np.array(
-    [[1, 0, 0],
-     [0, 0, 1],
-     [0, -1, 0]],
-    dtype=np.float32,
-)
+_R_INITIAL_GUESS = R_ALIGN_FALLBACK
 
 
 def _collect_confident_world_points(

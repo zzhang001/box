@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 import torch
 
+from pipeline._common import R_ALIGN_FALLBACK, detect_device
 from pipeline.gravity import estimate_gravity_rotation
 from pipeline.iphone_k import extract_K_from_mov
 from pipeline.run_vggt_slam import VGGTSLAMOutput, load_vggt_slam_output
@@ -80,16 +81,9 @@ class BoxerOutput:
 # --------------------------------------------------------------------------
 
 
-# Fallback rotation taking VGGT's Y-down world to Boxer's Z-down world when
-# gravity estimation is disabled or fails. Rx(-π/2) maps (x,y,z) → (x,-z,y)
-# so Y_world_vggt ([0,1,0]) → [0,0,-1]. `run_boxer()` can override this per
-# call with an estimate from floor-plane RANSAC (pipeline.gravity).
-_R_ALIGN_FALLBACK_3 = np.array(
-    [[1, 0, 0],
-     [0, 0, 1],
-     [0, -1, 0]],
-    dtype=np.float32,
-)
+# Re-exported under the old name for backwards-compat with any downstream
+# imports; new code should import from pipeline._common directly.
+_R_ALIGN_FALLBACK_3 = R_ALIGN_FALLBACK
 
 
 def _make_R_align_4(R3: np.ndarray) -> np.ndarray:
@@ -134,14 +128,12 @@ def _rescale_world_points_for_new_K(
     R_cw = extrinsic[:3, :3]     # camera_from_world rotation
     t_cw = extrinsic[:3, 3]      # camera_from_world translation
     pts_world = world_points.reshape(-1, 3)
-    # world → camera
-    pts_cam = (pts_world - t_cw[None]) @ R_cw.T     # wait: actually (R_cw @ (p_w - t))... let me be careful
-    # Actually extrinsic as [R|t] with p_cam = R p_w + t. So pts_cam = pts_world @ R_cw.T + t_cw.
+    # Extrinsic convention: p_cam = R_cw @ p_world + t_cw.
     pts_cam = pts_world @ R_cw.T + t_cw[None]
-    # Rescale X and Y in camera frame
+    # Rescale X, Y in camera frame to match the corrected K.
     pts_cam[:, 0] *= fx_ratio
     pts_cam[:, 1] *= fy_ratio
-    # camera → world: p_w = R_cw.T @ (p_c - t)
+    # camera → world: p_world = R_cw.T @ (p_cam - t_cw).
     pts_world_new = (pts_cam - t_cw[None]) @ R_cw
     return pts_world_new.reshape(H, W, 3).astype(np.float32)
 
@@ -396,13 +388,7 @@ def _build_datum(
 
 
 def _resolve_device(device: Optional[str]) -> str:
-    if device:
-        return device
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+    return device if device else detect_device()
 
 
 def _default_ckpt() -> Path:

@@ -43,12 +43,7 @@ from pipeline.run_vggt_slam import load_vggt_slam_output, VGGTSLAMOutput
 # --------------------------------------------------------------------------
 
 
-_R_FALLBACK = np.array(
-    [[1, 0, 0],
-     [0, 0, 1],
-     [0, -1, 0]],
-    dtype=np.float32,
-)
+from pipeline._common import R_ALIGN_FALLBACK as _R_FALLBACK  # noqa: E402
 
 
 def _invert_extrinsic_3x4(extr: np.ndarray) -> np.ndarray:

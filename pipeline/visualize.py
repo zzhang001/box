@@ -18,18 +18,8 @@ from typing import Optional
 import numpy as np
 import torch
 
+from pipeline._common import R_ALIGN_FALLBACK as _R_FALLBACK
 from pipeline.run_vggt_slam import load_vggt_slam_output
-
-
-# Rx(-π/2): same fallback used by pipeline.run_boxer. Applied here so scene
-# points + boxes end up in the same world frame when a fused scene graph
-# (which is in Boxer's gravity-aligned frame) is supplied.
-_R_FALLBACK = np.array(
-    [[1, 0, 0],
-     [0, 0, 1],
-     [0, -1, 0]],
-    dtype=np.float32,
-)
 
 
 def fuse_world_points(
@@ -47,7 +37,10 @@ def fuse_world_points(
     finite = np.isfinite(pts).all(axis=1)
     pts = pts[finite]
     if pts.shape[0] > max_points:
-        idx = np.linspace(0, pts.shape[0] - 1, max_points).astype(np.int64)
+        # Random (not linspace) — the filtered cloud may be ordered by
+        # confidence or spatial locality, so linspace would bias sampling.
+        rng = np.random.default_rng(0)
+        idx = rng.choice(pts.shape[0], size=max_points, replace=False)
         pts = pts[idx]
     return pts
 

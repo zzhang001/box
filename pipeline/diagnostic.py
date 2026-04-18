@@ -406,13 +406,11 @@ def run(
     # Apply same K rescale as per-frame would, per-frame (for accuracy) — but
     # metric A only needs a rough scene reference, so fuse after per-frame rescale.
     if K_native_override is not None:
-        # Rescale per frame and concatenate (mirrors run_boxer._build_global_sdp)
+        # Rescale per frame and concatenate (mirrors run_boxer._build_global_sdp).
         all_pts = []
         src_hw = vggt_out.image_size_hw
         K_vggt0 = vggt_out.intrinsic[0].numpy().astype(np.float32)
-        Ki_at_src = K_native_override.copy()
-        Ki_at_src[0, 0] *= src_hw[1] / K_native_override.shape[0] if False else 1.0  # no-op hack
-        # Proper scale to VGGT res:
+        # iPhone K at VGGT's internal resolution (294×518).
         H_nat, W_nat = map(int, meta["native_hw"])
         s_w = src_hw[1] / W_nat; s_h = src_hw[0] / H_nat
         Ki_at_src = K_native_override.copy()
