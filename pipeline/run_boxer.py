@@ -162,31 +162,58 @@ def _build_datum(
     caller so the same one is used across all frames (estimated once per
     video via floor-plane RANSAC or fallback Rx(-π/2)).
 
+    Image handling: pad to square (aspect-preserving) then isotropic-
+    resize to (hw, hw). **Do NOT anisotropically stretch 1920×1080 → hw²**
+    — BoxerNet is trained on ~4:3 indoor data and 16:9 iPhone stretch
+    creates a K with fx/fy ratio ~1.76 that BoxerNet isn't used to,
+    producing badly-localized 3D boxes.
+
     Returns (datum, img_bgr_cv2) — img_bgr_cv2 is handy for OWL visualization.
     """
     from loaders.base_loader import BaseLoader
     from utils.tw.pose import PoseTW
 
-    # 1. Image: load from disk at original resolution, resize to (hw, hw).
+    # 1. Image: load at native resolution, pad to square, isotropic-resize to
+    # boxer_hw × boxer_hw. Black-bar pads keep aspect; K scales isotropically.
     img_path = vggt_out.image_names[frame_idx]
     img_bgr = cv2.imread(img_path)
     if img_bgr is None:
         raise FileNotFoundError(f"Could not read {img_path}")
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img_resized = cv2.resize(img_rgb, (boxer_hw, boxer_hw))
+    orig_h, orig_w = img_rgb.shape[:2]
+    side = max(orig_h, orig_w)
+    pad_top = (side - orig_h) // 2
+    pad_bottom = side - orig_h - pad_top
+    pad_left = (side - orig_w) // 2
+    pad_right = side - orig_w - pad_left
+    img_square = cv2.copyMakeBorder(
+        img_rgb, pad_top, pad_bottom, pad_left, pad_right,
+        cv2.BORDER_CONSTANT, value=(0, 0, 0),
+    )
+    img_resized = cv2.resize(img_square, (boxer_hw, boxer_hw), interpolation=cv2.INTER_AREA)
     img0 = BaseLoader.img_to_tensor(img_resized)  # [1, 3, hw, hw] in [0, 1]
 
-    # 2. Intrinsics: VGGT K is for its internal resolution (image_size_hw).
-    # Stretch to (hw, hw) by scaling fx/cx by width ratio, fy/cy by height ratio.
+    # 2. Intrinsics: VGGT K is calibrated for its isotropic downscale (294×518).
+    # Scale it to the native image first (isotropic scale — 1920/518 ≈ 1080/294),
+    # then apply the pad offset to cy, then uniform-scale to (hw, hw).
     src_hw = vggt_out.image_size_hw
     K_vggt = vggt_out.intrinsic[frame_idx].numpy().astype(np.float32)
-    K_scaled = _scale_K(K_vggt, src_hw=src_hw, dst_hw=(boxer_hw, boxer_hw))
+    K_native = _scale_K(K_vggt, src_hw=src_hw, dst_hw=(orig_h, orig_w))
+    # Shift principal point into the padded square.
+    K_padded = K_native.copy()
+    K_padded[0, 2] += pad_left
+    K_padded[1, 2] += pad_top
+    # Uniform resize side → boxer_hw.
+    s = boxer_hw / side
+    K_boxer = K_padded.copy()
+    K_boxer[0, 0] *= s; K_boxer[0, 2] *= s
+    K_boxer[1, 1] *= s; K_boxer[1, 2] *= s
     cam = BaseLoader.pinhole_from_K(
         w=boxer_hw, h=boxer_hw,
-        fx=float(K_scaled[0, 0]),
-        fy=float(K_scaled[1, 1]),
-        cx=float(K_scaled[0, 2]),
-        cy=float(K_scaled[1, 2]),
+        fx=float(K_boxer[0, 0]),
+        fy=float(K_boxer[1, 1]),
+        cx=float(K_boxer[0, 2]),
+        cy=float(K_boxer[1, 2]),
     )
 
     # 3. Pose: invert extrinsic → T_world_camera, then apply gravity alignment.

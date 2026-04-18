@@ -1,27 +1,20 @@
-"""Rerun-based UI to inspect VGGT-SLAM + Boxer results side-by-side.
+"""Rerun-based UI for VGGT-SLAM + Boxer debug, at NATIVE image resolution.
 
-What you get:
-  • A time-scrubbable 2D image panel (left): per-keyframe RGB with the
-    associated 3D OBBs projected back onto the image. If a 3D box is
-    correctly localized, its wireframe hugs the object in the image;
-    if BoxerNet placed it wrong, you'll see the offset immediately.
-  • A 3D panel (right): fused world point cloud + fused OBBs as
-    colored wireframes, plus the camera frustum moving with the time
-    cursor.
+Left pane: the original iPhone frame (1920×1080, no stretching) with
+  • OWL's 2D detections (from pipeline.save_owl_bbs.json) drawn in-color.
+  • The 3D OBBs projected back onto the image (same frame).
+  If pose + K + 3D position are all correct, each projected OBB wireframe
+  hugs the object and overlaps the OWL 2D box that prompted it.
 
-Inputs:
-  • Cached VGGT-SLAM output (vggt_slam_output.pt).
-  • Per-frame Boxer CSV (boxer_3dbbs.csv).
-  • Fused scene graph (scene_graph_fused.json) [optional].
-  • iPhone frames on disk (referenced by `vggt_slam_output.image_names`).
+Right pane: the global 3D scene.
+  • Fused VGGT-SLAM point cloud (gray).
+  • Fused 3D OBBs (colored wireframes, labeled).
+  • Camera trajectory + current frustum synced to the time cursor.
 
-Launch rerun's native viewer with `--spawn` (default) or connect to an
-existing `rerun` instance with `--connect <host:port>`.
-
-All logged data lives under the `world/` entity, so 2D+3D share a
-common frame. Boxer's world frame (Z-down, gravity aligned) is used
-throughout; the VGGT-SLAM world points are rotated with the same R_align
-as the boxes.
+All 2D coordinates are rescaled from Boxer's 960×960 working space back to
+the native image resolution before drawing, so the image is displayed at
+its true aspect ratio. The K we use for projection is also rescaled to
+native, so projection lines up pixel-for-pixel.
 """
 
 from __future__ import annotations
@@ -33,9 +26,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Homebrew Python 3.11's site.py aggressively skips .pth files (even ones
-# without a leading underscore), which hides rerun-sdk's package root.
-# Force-add site-packages/rerun_sdk to sys.path so `import rerun` works.
+# Homebrew Python 3.11 site.py skips many .pth files. Force-add rerun_sdk.
 _RERUN_PATH = Path(__file__).resolve().parent.parent / ".venv" / "lib" / "python3.11" / "site-packages" / "rerun_sdk"
 if _RERUN_PATH.exists() and str(_RERUN_PATH) not in sys.path:
     sys.path.insert(0, str(_RERUN_PATH))
@@ -44,12 +35,11 @@ import cv2
 import numpy as np
 import torch
 
-from pipeline.gravity import estimate_gravity_rotation
 from pipeline.run_vggt_slam import load_vggt_slam_output, VGGTSLAMOutput
 
 
 # --------------------------------------------------------------------------
-# Geometry helpers (local copies to keep ui.py independent of run_boxer)
+# Geometry helpers
 # --------------------------------------------------------------------------
 
 
@@ -112,13 +102,7 @@ def _fuse_world_points(
     return pts
 
 
-# --------------------------------------------------------------------------
-# CSV parsing
-# --------------------------------------------------------------------------
-
-
 def _load_boxer_csv(csv_path: Path) -> dict[int, list[dict]]:
-    """Group per-frame CSV rows by time_ns. Returns {time_ns: [box_dict, ...]}."""
     out: dict[int, list[dict]] = {}
     with open(csv_path) as f:
         reader = csv.DictReader(f)
@@ -150,7 +134,6 @@ def _load_boxer_csv(csv_path: Path) -> dict[int, list[dict]]:
 
 
 def _box_corners_world(center: np.ndarray, size: np.ndarray, R: np.ndarray) -> np.ndarray:
-    """Return the 8 world-frame corners of an oriented box."""
     sx, sy, sz = size / 2.0
     corners_local = np.array(
         [
@@ -170,31 +153,23 @@ _EDGES = [
 
 
 def _project_box_to_image(
-    corners_world: np.ndarray,      # [8, 3]
-    T_world_camera: np.ndarray,     # [4, 4]
-    K: np.ndarray,                  # [3, 3]
+    corners_world: np.ndarray,
+    T_world_camera: np.ndarray,
+    K: np.ndarray,
     img_hw: tuple[int, int],
 ) -> Optional[np.ndarray]:
-    """Project 8 corners of an OBB into pixel space via K @ camera_from_world.
-
-    Returns None if the box is entirely behind the camera or off-image.
-    """
     T_cw = np.linalg.inv(T_world_camera)
     pts_h = np.concatenate([corners_world, np.ones((8, 1), dtype=np.float32)], axis=1)
     pts_cam = pts_h @ T_cw.T
     z = pts_cam[:, 2]
     if np.all(z <= 1e-3):
-        return None  # fully behind camera
-    # Avoid division by very small z
+        return None
     z_safe = np.where(z > 1e-3, z, np.nan)
     uv = (pts_cam[:, :2] / z_safe[:, None]) @ K[:2, :2].T + K[:2, 2]
-    valid = np.isfinite(uv).all(axis=1)
-    if not valid.any():
-        return None
     H, W = img_hw
-    # Quick off-image reject (keep if at least one corner lands within image)
-    on_image = valid & (uv[:, 0] >= -0.1 * W) & (uv[:, 0] < 1.1 * W) \
-                     & (uv[:, 1] >= -0.1 * H) & (uv[:, 1] < 1.1 * H)
+    valid = np.isfinite(uv).all(axis=1)
+    on_image = valid & (uv[:, 0] >= -0.2 * W) & (uv[:, 0] < 1.2 * W) \
+                     & (uv[:, 1] >= -0.2 * H) & (uv[:, 1] < 1.2 * H)
     if not on_image.any():
         return None
     return uv.astype(np.float32)
@@ -216,22 +191,19 @@ def log_to_rerun(
     *,
     vggt_slam_dir: Path,
     boxer_csv: Path,
+    owl_json: Optional[Path],
     scene_graph: Optional[Path],
     max_frames: Optional[int],
-    image_resize: int,
-    connect: Optional[str],
+    save_rrd: Optional[Path],
 ) -> None:
     import rerun as rr
 
-    # A horizontal split (2D image ↔ 3D scene) is set via blueprint below if
-    # the installed rerun version supports it; otherwise the user can
-    # manually drag the panels — Rerun remembers the layout.
     try:
         import rerun.blueprint as rrb
         blueprint = rrb.Blueprint(
             rrb.Horizontal(
-                rrb.Spatial2DView(origin="/world/camera/image", name="RGB + projected OBBs"),
-                rrb.Spatial3DView(origin="/world", name="Fused scene + boxes"),
+                rrb.Spatial2DView(origin="/world/camera/image", name="Frame + 2D/3D overlay"),
+                rrb.Spatial3DView(origin="/world", name="Global scene"),
                 column_shares=[1, 1],
             ),
             collapse_panels=True,
@@ -239,51 +211,65 @@ def log_to_rerun(
     except Exception:
         blueprint = None
 
-    if connect is not None:
+    if save_rrd is not None:
         rr.init("box-pipeline")
-        rr.connect(connect) if hasattr(rr, "connect") else rr.connect_tcp(connect)
+        if blueprint is not None:
+            rr.save(str(save_rrd), default_blueprint=blueprint)
+        else:
+            rr.save(str(save_rrd))
     else:
         if blueprint is not None:
             rr.init("box-pipeline", spawn=True, default_blueprint=blueprint)
         else:
             rr.init("box-pipeline", spawn=True)
 
-    # --- Load data ---
     print(f"[ui] loading VGGT-SLAM output from {vggt_slam_dir}")
     vggt_out = load_vggt_slam_output(Path(vggt_slam_dir))
 
     print(f"[ui] loading per-frame Boxer CSV from {boxer_csv}")
     per_frame_boxes = _load_boxer_csv(Path(boxer_csv))
 
-    fused_objects: list[dict] = []
-    if scene_graph is not None:
-        with open(scene_graph) as f:
-            fused_objects = json.load(f).get("objects", [])
-        print(f"[ui] loaded {len(fused_objects)} fused objects from {scene_graph}")
-
-    # CRITICAL: use the SAME R_align that run_boxer used when placing the
-    # boxes, otherwise projected OBBs visibly drift. run_boxer persists it to
-    # gravity.json next to the CSV; re-estimating from scratch here gives a
-    # slightly different rotation (RANSAC is stochastic) → 2D↔3D misalignment.
+    # Gravity: use the same R_align that run_boxer used (persisted in gravity.json).
     grav_path = Path(boxer_csv).parent / "gravity.json"
     if grav_path.exists():
         with open(grav_path) as f:
             grav_info = json.load(f)
         R_align_3 = np.array(grav_info["R_gravity"], dtype=np.float32)
-        print(f"[ui] loaded gravity rotation from {grav_path} "
-              f"(method={grav_info.get('method', 'unknown')}, "
-              f"tilt_deg={grav_info.get('tilt_correction_deg', 0):.2f})")
+        print(f"[ui] gravity from {grav_path.name}: {grav_info.get('method')}")
     else:
-        print(f"[ui] no gravity.json next to CSV — re-estimating (this may "
-              f"disagree with the rotation used at box-writing time)")
-        R_align_3, grav_info = estimate_gravity_rotation(vggt_out)
-        print(f"[ui]   method={grav_info['method']} "
-              f"tilt_deg={grav_info.get('tilt_correction_deg', 0):.2f}")
+        print(f"[ui] no gravity.json — using fallback Rx(-π/2)")
+        R_align_3 = _R_FALLBACK.copy()
     R_align_4 = np.eye(4, dtype=np.float32)
     R_align_4[:3, :3] = R_align_3
 
-    # --- Static world content (once, at time 0) ---
-    rr.set_time_seconds("frame_time", 0.0)
+    # OWL 2D detections: {time_ns: [{bb2d_xyxy, score, label}, ...]}, coords in
+    # `owl_image_resize × owl_image_resize` space. Newer runs also include
+    # `pad_info_by_time_ns` so we can undo the pad-to-square transform back
+    # to native image coords for display.
+    owl_by_time: dict[int, list[dict]] = {}
+    owl_pad_info: dict[int, dict] = {}
+    owl_image_resize = 960
+    owl_padded = False
+    if owl_json is not None and Path(owl_json).exists():
+        with open(owl_json) as f:
+            owl_data = json.load(f)
+        owl_image_resize = int(owl_data.get("image_resize", 960))
+        owl_padded = bool(owl_data.get("image_pad_to_square", False))
+        for k, v in owl_data.get("detections_by_time_ns", {}).items():
+            owl_by_time[int(k)] = v
+        for k, v in owl_data.get("pad_info_by_time_ns", {}).items():
+            owl_pad_info[int(k)] = v
+        print(f"[ui] loaded OWL 2D dets for {len(owl_by_time)} frames "
+              f"(coords in {owl_image_resize}² {'(pad-to-square)' if owl_padded else '(stretched)'})")
+
+    fused_objects: list[dict] = []
+    if scene_graph is not None and Path(scene_graph).exists():
+        with open(scene_graph) as f:
+            fused_objects = json.load(f).get("objects", [])
+        print(f"[ui] loaded {len(fused_objects)} fused objects")
+
+    # --- Static 3D content ---
+    rr.set_time("frame_time", duration=0.0)
 
     scene_pts = _fuse_world_points(vggt_out) @ R_align_3.T
     rr.log(
@@ -302,9 +288,7 @@ def log_to_rerun(
         quats = np.array([
             o.get("orientation_quat", [0, 0, 0, 1]) for o in fused_objects
         ], dtype=np.float32)
-        rotations = [
-            rr.Quaternion(xyzw=[q[0], q[1], q[2], q[3]]) for q in quats
-        ]
+        rotations = [rr.Quaternion(xyzw=[q[0], q[1], q[2], q[3]]) for q in quats]
         colors = np.array(
             [_color_for_label(o["label"]) for o in fused_objects], dtype=np.uint8
         )
@@ -322,62 +306,99 @@ def log_to_rerun(
             static=True,
         )
 
-    # --- Per-keyframe content ---
+    # --- Per-frame content ---
     n_keyframes = vggt_out.extrinsic.shape[0]
     if max_frames is not None:
         n_keyframes = min(n_keyframes, max_frames)
 
-    src_hw = vggt_out.image_size_hw   # (294, 518) on our test clip
+    src_hw = vggt_out.image_size_hw  # (294, 518) for our iPhone clip
 
     for i in range(n_keyframes):
         time_ns = int(vggt_out.frame_ids[i] * 1_000_000)
-        rr.set_time_seconds("frame_time", time_ns / 1e9)
-        rr.set_time_sequence("frame_idx", i)
+        rr.set_time("frame_time", duration=time_ns / 1e9)
+        rr.set_time("frame_idx", sequence=i)
 
-        # Load + resize image.
+        # Load image at NATIVE resolution — no stretching.
         img_path = vggt_out.image_names[i]
         img_bgr = cv2.imread(img_path)
         if img_bgr is None:
-            print(f"[ui] warning: could not read {img_path}")
             continue
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img_resized = cv2.resize(img_rgb, (image_resize, image_resize))
-        H, W = img_resized.shape[:2]
+        orig_H, orig_W = img_rgb.shape[:2]
 
-        # Pose + intrinsics, aligned into Boxer's world.
+        # Pose + intrinsics. K is scaled from VGGT's internal (294, 518) to the
+        # native (orig_H, orig_W) so projection happens in native pixel space.
         extr = vggt_out.extrinsic[i].numpy().astype(np.float32)
         T_wc = _invert_extrinsic_3x4(extr)
         T_wc_aligned = R_align_4 @ T_wc
 
-        K_scaled = _scale_K(
+        K_native = _scale_K(
             vggt_out.intrinsic[i].numpy().astype(np.float32),
-            src_hw=src_hw, dst_hw=(H, W),
+            src_hw=src_hw, dst_hw=(orig_H, orig_W),
         )
 
-        # Log camera frustum + pose into 3D.
         rr.log(
             "world/camera",
             rr.Transform3D(
                 translation=T_wc_aligned[:3, 3],
                 mat3x3=T_wc_aligned[:3, :3],
-                from_parent=False,
+                relation=rr.TransformRelation.ParentFromChild,
             ),
         )
         rr.log(
             "world/camera/image",
             rr.Pinhole(
-                image_from_camera=K_scaled,
-                resolution=[W, H],
+                image_from_camera=K_native,
+                resolution=[orig_W, orig_H],
             ),
         )
-        rr.log("world/camera/image", rr.Image(img_resized))
+        rr.log("world/camera/image", rr.Image(img_rgb))
 
-        # Per-frame 3D boxes for this frame: project their 8 corners into the
-        # image and log as 2D line strips. Also show them as 3D boxes
-        # (non-static so they animate per frame).
+        # Overlay: OWL's 2D boxes (rescaled back to native coords).
+        owl_dets = owl_by_time.get(time_ns, [])
+        if owl_dets:
+            owl_bbs = np.array(
+                [d["bb2d_xyxy"] for d in owl_dets], dtype=np.float32
+            )
+            if owl_padded:
+                # bb in [image_resize × image_resize] (pad-to-square). Undo:
+                #   1) scale from image_resize to the padded-square side
+                #   2) subtract pad_left/pad_top → native pixels
+                pad = owl_pad_info.get(time_ns, {})
+                side = pad.get("side", max(orig_H, orig_W))
+                pad_left = pad.get("pad_left", (side - orig_W) // 2)
+                pad_top = pad.get("pad_top", (side - orig_H) // 2)
+                s = side / owl_image_resize
+                owl_bbs[:, 0] = owl_bbs[:, 0] * s - pad_left
+                owl_bbs[:, 2] = owl_bbs[:, 2] * s - pad_left
+                owl_bbs[:, 1] = owl_bbs[:, 1] * s - pad_top
+                owl_bbs[:, 3] = owl_bbs[:, 3] * s - pad_top
+            else:
+                # Legacy: anisotropic stretch from image_resize → native.
+                sx = orig_W / owl_image_resize
+                sy = orig_H / owl_image_resize
+                owl_bbs[:, 0] *= sx; owl_bbs[:, 2] *= sx
+                owl_bbs[:, 1] *= sy; owl_bbs[:, 3] *= sy
+            owl_colors = np.array(
+                [_color_for_label(d["label"]) for d in owl_dets], dtype=np.uint8
+            )
+            owl_labels = [f"{d['label']} {d['score']:.2f}" for d in owl_dets]
+            rr.log(
+                "world/camera/image/owl_bbs",
+                rr.Boxes2D(
+                    array=owl_bbs,
+                    array_format=rr.Box2DFormat.XYXY,
+                    colors=owl_colors,
+                    labels=owl_labels,
+                    radii=2.0,
+                ),
+            )
+        else:
+            rr.log("world/camera/image/owl_bbs", rr.Clear(recursive=True))
+
+        # Per-frame 3D boxes + their projections onto the native image.
         frame_boxes = per_frame_boxes.get(time_ns, [])
         if frame_boxes:
-            # 3D log
             centers3 = np.array([b["center"] for b in frame_boxes], dtype=np.float32)
             sizes3 = np.array([b["size"] for b in frame_boxes], dtype=np.float32)
             rots3 = [
@@ -401,22 +422,19 @@ def log_to_rerun(
                 ),
             )
 
-            # Project each 3D box onto the image as a line strip over the 12 edges.
             strips_uv: list[np.ndarray] = []
             strip_colors: list[tuple[int, int, int]] = []
-            strip_labels: list[str] = []
             for b in frame_boxes:
                 R = _quat_to_R(*b["quat_xyzw"])
                 corners_w = _box_corners_world(b["center"], b["size"], R)
                 uv = _project_box_to_image(
-                    corners_w, T_wc_aligned, K_scaled, img_hw=(H, W)
+                    corners_w, T_wc_aligned, K_native, img_hw=(orig_H, orig_W)
                 )
                 if uv is None:
                     continue
                 for a, c in _EDGES:
                     strips_uv.append(np.stack([uv[a], uv[c]], axis=0))
                 strip_colors.extend([_color_for_label(b["label"])] * 12)
-                strip_labels.extend([b["label"]] * 12)
             if strips_uv:
                 rr.log(
                     "world/camera/image/projected_obbs",
@@ -432,37 +450,35 @@ def log_to_rerun(
             rr.log("world/camera/image/projected_obbs", rr.Clear(recursive=True))
             rr.log("world/frame_boxes", rr.Clear(recursive=True))
 
-        if (i + 1) % 10 == 0 or i == n_keyframes - 1:
+        if (i + 1) % 25 == 0 or i == n_keyframes - 1:
             print(f"[ui] logged {i+1}/{n_keyframes} frames")
 
-    print("[ui] done; viewer is live — scrub the time cursor to replay frames")
+    print("[ui] done")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--vggt-slam", type=Path, required=True,
-                        help="Directory containing vggt_slam_output.pt")
-    parser.add_argument("--boxer-csv", type=Path, required=True,
-                        help="Per-frame boxer_3dbbs.csv from pipeline.run_boxer")
-    parser.add_argument("--scene-graph", type=Path, default=None,
-                        help="Optional scene_graph_fused.json (static fused boxes)")
+    parser.add_argument("--vggt-slam", type=Path, required=True)
+    parser.add_argument("--boxer-csv", type=Path, required=True)
+    parser.add_argument("--owl-json", type=Path, default=None,
+                        help="pipeline.save_owl_bbs JSON of per-frame 2D detections")
+    parser.add_argument("--scene-graph", type=Path, default=None)
     parser.add_argument("--max-frames", type=int, default=None)
-    parser.add_argument("--image-resize", type=int, default=960,
-                        help="Resize images to this square resolution; should match "
-                             "Boxer's hw so the projected OBBs align with what BoxerNet saw")
-    parser.add_argument("--connect", type=str, default=None,
-                        help="host:port of an already-running rerun viewer "
-                             "(default: spawn a new one)")
+    parser.add_argument("--save-rrd", type=Path, default=None,
+                        help="Save to .rrd instead of spawning; open with `rerun <file>`")
     args = parser.parse_args()
 
     log_to_rerun(
         vggt_slam_dir=args.vggt_slam,
         boxer_csv=args.boxer_csv,
+        owl_json=args.owl_json,
         scene_graph=args.scene_graph,
         max_frames=args.max_frames,
-        image_resize=args.image_resize,
-        connect=args.connect,
+        save_rrd=args.save_rrd,
     )
+
+    if args.save_rrd is not None:
+        print(f"[ui] open with: rerun {args.save_rrd}")
 
 
 if __name__ == "__main__":
