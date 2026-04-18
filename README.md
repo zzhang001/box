@@ -278,10 +278,7 @@ box/
 │   ├── export.py               # 3D boxes → scene_graph.json
 │   └── run.py                  # End-to-end orchestrator
 │
-├── test/                       # Local iPhone footage (gitignored — never committed)
-│
-└── examples/
-    └── README.md               # How to test with sample data
+└── test/                       # Local iPhone footage (gitignored — never committed)
 ```
 
 ---
@@ -356,6 +353,32 @@ python -m pipeline.export --boxer-output output/boxer/ --output scene_graph.json
 # Produces output/vggt_slam/fused.ply — openable in MeshLab / CloudCompare / 3dviewer.net
 python -m pipeline.visualize --input output/vggt_slam/ --output output/vggt_slam/fused.ply
 ```
+
+### Tips for capturing a good iPhone clip
+
+1. **Record**: walk slowly through a room, keep the phone roughly upright, avoid fast rotations.
+2. **Transfer**: AirDrop or USB to your Mac. Drop the `.MOV` into `test/` (gitignored).
+3. **Run**: `python -m pipeline.run --video test/my_room.MOV --output output/`
+4. **Inspect**: `output/scene_graph.json` for the 3D object list, or open `output/vggt_slam/fused.ply` in MeshLab.
+
+**What makes a clip work well:**
+- **Keep FPS ≥ 10** when extracting. Below that, VGGT-SLAM's optical-flow keyframe selector loses temporal baseline. 12 fps is our default.
+- **Steady movement.** Slow, smooth camera motion gives VGGT better depth estimates.
+- **Overlap.** Consecutive keyframes need >60% visual overlap; the keyframe selector drops frames whose optical-flow disparity is below `--min-disparity` (default 50).
+- **Lighting.** Well-lit scenes produce better 2D detections.
+- **Submap size.** 16 frames per submap balances VGGT memory vs. pose-graph granularity. Drop to 8-12 if you OOM on MPS.
+- **Loop closures.** `--max-loops 1` (default) is fine for room-scale scans. Longer walks with revisits are handled automatically by the DINOv2+SALAD image-retrieval backbone.
+
+### Weights downloaded on first run
+
+| File | Size | Location | Fetched by |
+|------|------|----------|------------|
+| VGGT-1B | ~5 GB | `~/.cache/torch/hub/checkpoints/model.pt` | `pipeline.run_vggt_slam` at first inference |
+| DINOv2 ViT-B/14 | ~330 MB | same cache dir | same |
+| `dino_salad.ckpt` | ~335 MB | same cache dir | `setup.sh` |
+| BoxerNet + DINOv3 + OWLv2 | ~640 MB total | `extern/boxer/ckpts/` | `extern/boxer/scripts/download_ckpts.sh` |
+
+Subsequent runs reuse the caches.
 
 ### Output Format
 
