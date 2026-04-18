@@ -632,7 +632,7 @@ This pipeline code is MIT licensed. Submodules have their own licenses:
 
 ## Acknowledgments
 
-- [VGGT-SLAM](https://github.com/MIT-SPARK/VGGT-SLAM) — Dominic Maggio et al., MIT-SPARK Lab (2.0, 2026), built on [VGGT](https://github.com/facebookresearch/vggt) (Jianyuan Wang et al., CVPR 2025 Best Paper)
+- [VGGT-SLAM](https://github.com/MIT-SPARK/VGGT-SLAM) — Dominic Maggio et al., MIT-SPARK Lab
 - [Boxer](https://github.com/facebookresearch/boxer) — Daniel DeTone et al., Meta Reality Labs
-- [OWLv2](https://arxiv.org/abs/2306.09683) — Minderer et al., Google Research (NeurIPS 2023)
-- [DINOv3](https://github.com/facebookresearch/dinov3) — Oquab et al., Meta FAIR
+- [OWLv2](https://arxiv.org/abs/2306.09683) — Matthias Minderer et al., Google Research
+- [DINOv3](https://github.com/facebookresearch/dinov3) — Maxime Oquab et al., Meta FAIR
