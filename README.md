@@ -253,6 +253,36 @@ Net effect: 20 noisy chair detections → 1 crisper chair box with tighter estim
 
 We default to **fusion** for the iPhone room-scan pipeline; `--track` is planned for the ROS2 robot path.
 
+### Camera intrinsics: why VGGT's estimate isn't good enough
+
+**TL;DR.** VGGT is trained to regress `K` from RGB along with depth and pose — this lets it run on any camera without calibration. But for iPhone footage it systematically **overestimates `fx`/`fy` by ~26%**, which propagates into monocular-depth scale errors and 3D-box drift.
+
+**The data point.** Our iPhone Air test clip (`test/IMG_6826.MOV`):
+
+```
+ffprobe/exiftool metadata from the .MOV:
+  Lens model               : iPhone Air back camera 5.96mm f/1.6
+  Focal length (35mm equiv): 26 mm
+  Clean aperture           : 1920×1080
+```
+
+This gives a **real** intrinsic matrix at native resolution:
+
+| | fx (px) | fy (px) | cx | cy | HFOV |
+|---|---|---|---|---|---|
+| **iPhone EXIF (ground truth)** | 1386 | 1386 | 960 | 540 | **69.4°** |
+| **VGGT predicted** (scaled from 518×294 to 1920×1080) | 1750 | 1735 | 960 | 540 | 57.4° |
+
+VGGT's `fx` is **+26% larger** than reality. Equivalent statement: VGGT thinks the iPhone sees a 57° HFOV when the real lens is 69° (wide-angle). This is a training-distribution mismatch — VGGT's training mix skews toward narrower indoor camera rigs (ScanNet, CO3D, Habitat renderings) than a 26mm-equiv smartphone wide-angle.
+
+**Why it matters for 3D boxes.** BoxerNet's monocular 3D lifting fundamentally relies on the image-to-ray mapping defined by `K`. An overestimated `fx` means BoxerNet thinks a given 2D-bbox subtends a smaller angular footprint than it really does → compensates by pushing the box **farther away** along its ray → the 3D box drifts behind the actual object. The error is systematic and multiplicative: at 1.26× K overestimate, a box at true 1m depth gets placed at roughly 1.26m. That matches the remaining ~20-30 cm residual drift we observe after fixing K anisotropy and SDP confidence.
+
+**Multi-view reasoning doesn't automatically fix this.** You might expect VGGT-SLAM's SL(4) bundle-ish adjustment or the global-fused SDP to "average out" per-frame `K` errors. But the error is **systematic** — every frame uses the same overestimated `K`, so every frame's reconstruction is uniformly stretched and the submaps align consistently at the wrong scale. No amount of averaging corrects a population-wide bias.
+
+**The fix we're prototyping.** `pipeline.iphone_k.extract_K_from_mov(<path>.MOV)` parses MOV EXIF (lens model, 35mm equivalent) and constructs the real pinhole `K` at the native image resolution. `run_boxer.py --override-k-from-mov` substitutes this into Boxer's datum (keeping VGGT's depth + pose, but consistently rescaling VGGT's world points so they re-project correctly through the corrected `K`). This is a cheap, honest experiment: if boxes tighten up, known-`K` is necessary and sufficient; if not, the remaining drift is VGGT-depth-metric-scale which needs a depth-only replacement (e.g., Apple Depth Pro, which accepts `K` as input).
+
+**Why we didn't just do this from the start.** VGGT-SLAM's upstream assumes full end-to-end RGB → (K, depth, pose). Pulling `K` out of EXIF breaks that symmetry for only one camera family. It's the right thing for our iPhone path, but not a general replacement — the override is gated behind a CLI flag.
+
 ---
 
 ## Project Structure

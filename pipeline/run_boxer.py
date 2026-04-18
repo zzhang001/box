@@ -33,6 +33,7 @@ import numpy as np
 import torch
 
 from pipeline.gravity import estimate_gravity_rotation
+from pipeline.iphone_k import extract_K_from_mov
 from pipeline.run_vggt_slam import VGGTSLAMOutput, load_vggt_slam_output
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -107,6 +108,44 @@ def _invert_extrinsic_3x4(extr: np.ndarray) -> np.ndarray:
     return T
 
 
+def _rescale_world_points_for_new_K(
+    world_points: np.ndarray,   # [H, W, 3] in VGGT world frame
+    extrinsic: np.ndarray,      # [3, 4] camera_from_world
+    fx_ratio: float,
+    fy_ratio: float,
+) -> np.ndarray:
+    """Rescale VGGT world points to be consistent with a new K.
+
+    VGGT unprojects a pixel (u, v) at depth z via its own K:
+        X_cam_vggt = (u - cx) * z / fx_vggt
+    If we replace K with K_real (different fx), the correct camera-frame X is
+    X_cam_real = X_cam_vggt * (fx_vggt / fx_real) = X_cam_vggt * fx_ratio.
+    Same for Y. Z (depth) is unchanged.
+
+    Since we need to stay in world frame (for pose consistency), we:
+      1. Transform world points → camera frame via the frame's extrinsic.
+      2. Scale X, Y in camera frame.
+      3. Transform back to world with the same extrinsic.
+
+    Different frames rotate the per-axis rescale differently in world-frame
+    coordinates; that's expected — the correction is per-ray-of-that-camera.
+    """
+    H, W, _ = world_points.shape
+    R_cw = extrinsic[:3, :3]     # camera_from_world rotation
+    t_cw = extrinsic[:3, 3]      # camera_from_world translation
+    pts_world = world_points.reshape(-1, 3)
+    # world → camera
+    pts_cam = (pts_world - t_cw[None]) @ R_cw.T     # wait: actually (R_cw @ (p_w - t))... let me be careful
+    # Actually extrinsic as [R|t] with p_cam = R p_w + t. So pts_cam = pts_world @ R_cw.T + t_cw.
+    pts_cam = pts_world @ R_cw.T + t_cw[None]
+    # Rescale X and Y in camera frame
+    pts_cam[:, 0] *= fx_ratio
+    pts_cam[:, 1] *= fy_ratio
+    # camera → world: p_w = R_cw.T @ (p_c - t)
+    pts_world_new = (pts_cam - t_cw[None]) @ R_cw
+    return pts_world_new.reshape(H, W, 3).astype(np.float32)
+
+
 def _scale_K(K: np.ndarray, src_hw: tuple[int, int], dst_hw: tuple[int, int]) -> np.ndarray:
     """Scale a pinhole K from src_hw to dst_hw (anisotropic if aspect differs)."""
     src_h, src_w = src_hw
@@ -156,21 +195,31 @@ def _build_global_sdp(
     R_align_3: np.ndarray,
     conf_percentile: float = 90.0,
     max_points: int = 400_000,
+    fx_ratio: Optional[float] = None,
+    fy_ratio: Optional[float] = None,
 ) -> np.ndarray:
     """Fuse all per-frame world points into ONE global cloud in Boxer world frame.
 
-    Used with `sdp_mode="global"`: every frame gets the same globally-consistent
-    scene cloud (cropped to its view frustum at datum time). This sidesteps the
-    per-submap SL(4) scale drift problem — instead of each frame carrying its
-    own locally-VGGT depth (which may be at a different scale than the pose),
-    every frame sees the same fused cloud which, once averaged across all
-    submaps, is closer to metric.
+    If (fx_ratio, fy_ratio) is given, per-frame world points are rescaled
+    to be consistent with an overridden K before fusion. See
+    `_rescale_world_points_for_new_K` for the math.
     """
-    pts = vggt_out.world_points.reshape(-1, 3).numpy().astype(np.float32)
-    conf = vggt_out.world_points_conf.reshape(-1).numpy().astype(np.float32)
-    thresh = float(np.percentile(conf, conf_percentile))
-    mask = (conf > thresh) & np.isfinite(pts).all(axis=1)
-    pts = pts[mask]
+    all_pts: list[np.ndarray] = []
+    S = vggt_out.world_points.shape[0]
+    for i in range(S):
+        wp = vggt_out.world_points[i].numpy().astype(np.float32)
+        conf = vggt_out.world_points_conf[i].numpy().astype(np.float32)
+        if fx_ratio is not None and fy_ratio is not None:
+            wp = _rescale_world_points_for_new_K(
+                wp, vggt_out.extrinsic[i].numpy().astype(np.float32),
+                fx_ratio=fx_ratio, fy_ratio=fy_ratio,
+            )
+        pts = wp.reshape(-1, 3)
+        c = conf.reshape(-1)
+        thresh = float(np.percentile(c, conf_percentile))
+        mask = (c > thresh) & np.isfinite(pts).all(axis=1)
+        all_pts.append(pts[mask])
+    pts = np.concatenate(all_pts, axis=0).astype(np.float32)
     rng = np.random.default_rng(0)
     if pts.shape[0] > max_points:
         idx = rng.choice(pts.shape[0], size=max_points, replace=False)
@@ -219,6 +268,8 @@ def _build_datum(
     R_align_3: np.ndarray,
     R_align_4: np.ndarray,
     global_sdp: Optional[np.ndarray] = None,
+    K_native_override: Optional[np.ndarray] = None,
+    native_hw_override: Optional[tuple[int, int]] = None,
 ):
     """Build a Boxer datum dict for one VGGT-SLAM keyframe.
 
@@ -263,7 +314,18 @@ def _build_datum(
     # then apply the pad offset to cy, then uniform-scale to (hw, hw).
     src_hw = vggt_out.image_size_hw
     K_vggt = vggt_out.intrinsic[frame_idx].numpy().astype(np.float32)
-    K_native = _scale_K(K_vggt, src_hw=src_hw, dst_hw=(orig_h, orig_w))
+    K_native_vggt = _scale_K(K_vggt, src_hw=src_hw, dst_hw=(orig_h, orig_w))
+    # If the caller supplies a native-resolution K override (e.g. from iPhone
+    # EXIF), use it instead of VGGT's estimate. The expected native_hw must
+    # match the image we loaded.
+    if K_native_override is not None:
+        if native_hw_override is not None:
+            assert tuple(native_hw_override) == (orig_h, orig_w), (
+                f"native_hw_override={native_hw_override} vs loaded image {(orig_h, orig_w)}"
+            )
+        K_native = K_native_override.astype(np.float32)
+    else:
+        K_native = K_native_vggt
     # Shift principal point into the padded square.
     K_padded = K_native.copy()
     K_padded[0, 2] += pad_left
@@ -300,6 +362,14 @@ def _build_datum(
     else:
         # Mode: per-frame — use this frame's VGGT world points after conf filter.
         wp = vggt_out.world_points[frame_idx].numpy().astype(np.float32)   # [H, W, 3]
+        # If we overrode K, rescale VGGT's points so they remain consistent with
+        # the new pinhole geometry (per-frame, in camera frame — see docstring).
+        if K_native_override is not None:
+            fx_ratio = float(K_native_vggt[0, 0] / K_native_override[0, 0])
+            fy_ratio = float(K_native_vggt[1, 1] / K_native_override[1, 1])
+            wp = _rescale_world_points_for_new_K(
+                wp, extr, fx_ratio=fx_ratio, fy_ratio=fy_ratio,
+            )
         wp_aligned = wp @ R_align_3.T                                       # rotate into Z-down world
         conf = vggt_out.world_points_conf[frame_idx].numpy().astype(np.float32)
         sdp_w = _sample_sdp_from_world_points(wp_aligned, conf, num_samples=10000)
@@ -352,6 +422,7 @@ def run_boxer(
     max_frames: Optional[int] = None,
     estimate_gravity: bool = True,
     sdp_mode: str = "perframe",
+    override_k_from_mov: Optional[Path] = None,
 ) -> BoxerOutput:
     """Run OWLv2 + BoxerNet on a cached VGGT-SLAM output.
 
@@ -414,14 +485,46 @@ def run_boxer(
     with open(output_dir / "gravity.json", "w") as f:
         _json.dump({"R_gravity": R_align_3.tolist(), **grav_info}, f, indent=2)
 
+    # Optional known-K override (e.g. from iPhone EXIF) — replaces VGGT's
+    # estimated K in the Boxer datum, AND rescales per-frame world points
+    # so they stay consistent with the new pinhole geometry.
+    K_native_override: Optional[np.ndarray] = None
+    native_hw_override: Optional[tuple[int, int]] = None
+    fx_ratio: Optional[float] = None
+    fy_ratio: Optional[float] = None
+    if override_k_from_mov is not None:
+        K_native_override, native_hw_override, meta = extract_K_from_mov(Path(override_k_from_mov))
+        print(f"[boxer] K override from {override_k_from_mov}: "
+              f"fx={K_native_override[0,0]:.1f} fy={K_native_override[1,1]:.1f} "
+              f"HFOV={meta['hfov_deg']:.1f}° (lens={meta.get('lens_model')})")
+        # Compute the ratio VGGT's native-scaled K / iPhone K, used for
+        # per-frame point rescaling inside _build_datum / _build_global_sdp.
+        # The ratio is the same at VGGT's original res (294×518) and at
+        # native (1080×1920) because both K's scale isotropically between
+        # them, so we use the override's native K.
+        src_hw = vggt_out.image_size_hw
+        Ki_at_src = K_native_override.copy()
+        Ki_at_src[0, 0] *= src_hw[1] / native_hw_override[1]
+        Ki_at_src[0, 2] *= src_hw[1] / native_hw_override[1]
+        Ki_at_src[1, 1] *= src_hw[0] / native_hw_override[0]
+        Ki_at_src[1, 2] *= src_hw[0] / native_hw_override[0]
+        K_vggt0 = vggt_out.intrinsic[0].numpy().astype(np.float32)
+        fx_ratio = float(K_vggt0[0, 0] / Ki_at_src[0, 0])
+        fy_ratio = float(K_vggt0[1, 1] / Ki_at_src[1, 1])
+        print(f"[boxer]   world-point rescale ratios: fx_ratio={fx_ratio:.3f} fy_ratio={fy_ratio:.3f}")
+
     # Optionally precompute the globally-fused scene cloud (used when
     # sdp_mode="global"). Expensive for ~300k points, but a one-time cost.
     global_sdp: Optional[np.ndarray] = None
     if sdp_mode == "global":
-        global_sdp = _build_global_sdp(vggt_out, R_align_3)
-        print(f"[boxer] sdp_mode=global: {global_sdp.shape[0]} fused points")
+        global_sdp = _build_global_sdp(
+            vggt_out, R_align_3, fx_ratio=fx_ratio, fy_ratio=fy_ratio,
+        )
+        print(f"[boxer] sdp_mode=global: {global_sdp.shape[0]} fused points"
+              + (" (K-rescaled)" if fx_ratio is not None else ""))
     elif sdp_mode == "perframe":
-        print("[boxer] sdp_mode=perframe (VGGT per-frame points, top 10% conf)")
+        print("[boxer] sdp_mode=perframe (VGGT per-frame points, top 10% conf)"
+              + (" (K-rescaled)" if fx_ratio is not None else ""))
     else:
         raise ValueError(f"Unknown sdp_mode={sdp_mode!r}; use 'perframe' or 'global'")
 
@@ -456,7 +559,10 @@ def run_boxer(
     t0 = time.time()
     for i in range(n_keyframes):
         datum, _img_bgr = _build_datum(
-            vggt_out, i, boxer_hw, R_align_3, R_align_4, global_sdp=global_sdp,
+            vggt_out, i, boxer_hw, R_align_3, R_align_4,
+            global_sdp=global_sdp,
+            K_native_override=K_native_override,
+            native_hw_override=native_hw_override,
         )
 
         # OWLv2 expects input in [0, 255].
@@ -583,6 +689,11 @@ if __name__ == "__main__":
                         help="'perframe' (default) uses each frame's VGGT depth; "
                              "'global' passes the fused scene cloud cropped to "
                              "the frustum — more robust to per-submap scale drift")
+    parser.add_argument("--override-k-from-mov", type=Path, default=None,
+                        help="Parse iPhone .MOV EXIF to get the real camera K "
+                             "and substitute it for VGGT's estimate. Rescales "
+                             "per-frame world points to stay consistent with "
+                             "the corrected pinhole geometry.")
     parser.add_argument("--scene-graph", type=Path, default=None,
                         help="Also write scene_graph.json here (default: <output>/scene_graph.json)")
     args = parser.parse_args()
@@ -597,6 +708,7 @@ if __name__ == "__main__":
         thresh_3d=args.thresh_3d,
         max_frames=args.max_frames,
         sdp_mode=args.sdp_mode,
+        override_k_from_mov=args.override_k_from_mov,
     )
 
     # Also emit scene_graph.json for a self-contained CLI run.
